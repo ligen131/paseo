@@ -70,6 +70,7 @@ describe("loadAppSettingsFromStorage", () => {
 
     expect(result).toEqual(DEFAULT_CLIENT_SETTINGS);
     expect(DEFAULT_CLIENT_SETTINGS.language).toBe("system");
+    expect(DEFAULT_CLIENT_SETTINGS.sendBehavior).toBe("steer");
     expect(deps.storage.entries.get(APP_SETTINGS_KEY)).toBe(
       JSON.stringify(DEFAULT_CLIENT_SETTINGS),
     );

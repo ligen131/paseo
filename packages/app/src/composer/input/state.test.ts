@@ -3,6 +3,7 @@ import {
   applyDictationTranscript,
   computeCanStartDictation,
   resolveComposerSurfacePresentation,
+  resolveImmediateSendActiveTurnBehavior,
   runAlternateSendAction,
   runDefaultSendAction,
   runMessageInputKeyboardAction,
@@ -188,6 +189,14 @@ describe("dictation transcript behavior", () => {
 });
 
 describe("composer send behavior", () => {
+  it.each([
+    ["interrupt", "interrupt"],
+    ["steer", "steer"],
+    ["queue", "steer"],
+  ] as const)("uses %s immediate sends as %s", (sendBehavior, expected) => {
+    expect(resolveImmediateSendActiveTurnBehavior(sendBehavior)).toBe(expected);
+  });
+
   function actions() {
     const calls: string[] = [];
     return {

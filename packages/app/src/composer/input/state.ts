@@ -110,6 +110,12 @@ export function computeCanStartDictation(input: {
   );
 }
 
+export function resolveImmediateSendActiveTurnBehavior(
+  sendBehavior: SendBehavior,
+): ActiveTurnBehavior {
+  return sendBehavior === "interrupt" ? "interrupt" : "steer";
+}
+
 export function runDefaultSendAction(ctx: SendActionContext): void {
   if (ctx.defaultSendBehavior === "queue" && ctx.isAgentRunning && ctx.onQueue) {
     ctx.handleQueueMessage();

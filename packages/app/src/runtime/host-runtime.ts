@@ -44,7 +44,7 @@ import {
 import { getDesktopHost } from "@/desktop/host";
 import { CLIENT_CAPS } from "@getpaseo/protocol/client-capabilities";
 import { BROWSER_AUTOMATION_COMMAND_NAMES } from "@getpaseo/protocol/browser-automation/rpc-schemas";
-import { useSessionStore } from "@/stores/session-store";
+import { selectAgentTurnPresentation, useSessionStore } from "@/stores/session-store";
 import { useWorkspaceSetupStore } from "@/stores/workspace-setup-store";
 import { invalidateCheckoutGitQueriesForServer } from "@/git/query-keys";
 import { queryClient } from "@/data/query-client";
@@ -2156,7 +2156,15 @@ export class HostRuntimeStore {
     const session = store.sessions[serverId];
     const queue = session?.queuedMessages.get(agentId);
     const client = session?.client;
-    if (!client || !queue?.length || session.initializingAgents.get(agentId) === true) {
+    const agent = session?.agents.get(agentId) ?? session?.agentDetails.get(agentId);
+    const isActive = selectAgentTurnPresentation(session, agentId).isActive;
+    if (
+      !client ||
+      !queue?.length ||
+      session.initializingAgents.get(agentId) === true ||
+      agent?.status === "running" ||
+      isActive
+    ) {
       return;
     }
     this.queuedAgentDrainInFlight.add(drainKey);
@@ -2182,6 +2190,7 @@ export class HostRuntimeStore {
           }),
           encodeImages,
           submission: createMessageSubmissionWriter(serverId),
+          activeTurnBehavior: "steer",
         });
       },
     })

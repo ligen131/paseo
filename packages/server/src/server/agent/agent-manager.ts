@@ -2365,26 +2365,45 @@ export class AgentManager {
     prompt: AgentPromptInput,
     options?: AgentRunOptions,
   ): Promise<AsyncGenerator<AgentStreamEvent>> {
-    const snapshot = this.requireAgent(agentId);
-    if (
-      snapshot.lifecycle !== "running" &&
-      !snapshot.activeForegroundTurnId &&
-      !this.runs.hasRun(agentId)
-    ) {
-      return this.streamAgent(agentId, prompt, options);
-    }
+    return this.runForegroundMutation(agentId, async () => {
+      const agent = this.requireSessionAgent(agentId);
+      if (
+        agent.lifecycle !== "running" &&
+        !agent.activeForegroundTurnId &&
+        !this.runs.hasRun(agentId)
+      ) {
+        return this.streamAgent(agentId, prompt, options);
+      }
+      return this.replaceAgentRunNow(agent, prompt, options);
+    });
+  }
 
-    const agent = this.requireSessionAgent(agentId);
+  private async replaceAgentRunNow(
+    agent: ActiveManagedAgent,
+    prompt: AgentPromptInput,
+    options?: AgentRunOptions,
+  ): Promise<AsyncGenerator<AgentStreamEvent>> {
     agent.pendingReplacement = true;
     agent.lifecycle = "running";
     this.touchUpdatedAt(agent);
     this.emitState(agent);
 
     try {
-      await this.cancelAgentRunBefore(agentId, "replace");
-      return this.streamAgent(agentId, prompt, options);
+      do {
+        const result = await this.cancelAgentRunNow(agent.id);
+        if (result.status === "refused") {
+          throw new AgentRunCancellationError(agent.id, "replace");
+        }
+        // The canceled turn can synchronously release a background task notification. Drain it
+        // before reserving the replacement so an autonomous wake cannot claim the same agent in
+        // the cancellation-to-start gap.
+        await this.drainSessionEvents(agent.id);
+        this.agentStreamCoalescer.flushFor(agent.id);
+      } while (agent.activeForegroundTurnId || this.runs.hasRun(agent.id));
+
+      return this.streamAgent(agent.id, prompt, options);
     } catch (error) {
-      const latest = this.agents.get(agentId);
+      const latest = this.agents.get(agent.id);
       if (latest) {
         latest.pendingReplacement = false;
       }
@@ -2512,22 +2531,12 @@ export class AgentManager {
     prompt: AgentPromptInput,
     options?: AgentRunOptions,
   ): Promise<AsyncGenerator<AgentStreamEvent>> {
-    this.assertSteerAdmissionOwnsForeground(agent, expectedTurnId);
-    agent.pendingReplacement = true;
-    agent.lifecycle = "running";
-    this.touchUpdatedAt(agent);
-    this.emitState(agent);
-
-    try {
-      await this.cancelAgentRunBefore(agent.id, "replace");
-      return this.streamAgent(agent.id, prompt, options);
-    } catch (error) {
-      const latest = this.agents.get(agent.id);
-      if (latest) {
-        latest.pendingReplacement = false;
-      }
-      throw error;
-    }
+    return this.runForegroundMutation(agent.id, async () => {
+      await this.drainSessionEvents(agent.id);
+      this.agentStreamCoalescer.flushFor(agent.id);
+      this.assertSteerAdmissionOwnsForeground(agent, expectedTurnId);
+      return this.replaceAgentRunNow(agent, prompt, options);
+    });
   }
 
   private async recordAcceptedSteer(

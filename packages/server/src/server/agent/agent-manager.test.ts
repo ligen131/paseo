@@ -6374,6 +6374,170 @@ test("replaceAgentRun does not emit idle or resolve waiters between interrupted 
   unsubscribe();
 });
 
+test("replaceAgentRun cancels an autonomous wake that arrives during replacement admission", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-replace-autonomous-wake-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+
+  class AutonomousWakeDuringReplacementSession extends TestAgentSession {
+    interruptCount = 0;
+    startCount = 0;
+
+    override async startTurn(): Promise<{ turnId: string }> {
+      const turnId = `foreground-${++this.startCount}`;
+      setTimeout(
+        () => this.pushEvent({ type: "turn_started", provider: this.provider, turnId }),
+        0,
+      );
+      return { turnId };
+    }
+
+    override async interrupt(): Promise<void> {
+      this.interruptCount += 1;
+      if (this.interruptCount === 1) {
+        this.pushEvent({
+          type: "turn_canceled",
+          provider: this.provider,
+          reason: "Interrupted",
+          turnId: "foreground-1",
+        });
+        this.pushEvent({
+          type: "turn_started",
+          provider: this.provider,
+          turnId: "autonomous-wake-1",
+        });
+        return;
+      }
+      this.pushEvent({
+        type: "turn_canceled",
+        provider: this.provider,
+        reason: "Interrupted",
+        turnId: "autonomous-wake-1",
+      });
+    }
+  }
+
+  class AutonomousWakeDuringReplacementClient extends TestAgentClient {
+    readonly session = new AutonomousWakeDuringReplacementSession({
+      provider: "codex",
+      cwd: workdir,
+    });
+
+    override async createSession(): Promise<AgentSession> {
+      return this.session;
+    }
+  }
+
+  const client = new AutonomousWakeDuringReplacementClient();
+  const manager = new AgentManager({
+    clients: { codex: client },
+    registry: storage,
+    logger,
+    idFactory: () => "00000000-0000-4000-8000-000000000146",
+  });
+
+  try {
+    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    const firstRun = manager.streamAgent(agent.id, "first run");
+    const firstRunDrain = (async () => {
+      for await (const _event of firstRun) {
+        // Drain the interrupted foreground turn.
+      }
+    })();
+    await manager.waitForAgentRunStart(agent.id);
+
+    const replacementRun = await manager.replaceAgentRun(agent.id, "replacement run");
+    const replacementDrain = (async () => {
+      for await (const _event of replacementRun) {
+        // Drain the accepted replacement turn.
+      }
+    })();
+    await manager.waitForAgentRunStart(agent.id);
+
+    expect(client.session.interruptCount).toBe(2);
+    expect(client.session.startCount).toBe(2);
+
+    client.session.pushEvent({
+      type: "turn_completed",
+      provider: client.session.provider,
+      turnId: "foreground-2",
+    });
+    await firstRunDrain;
+    await replacementDrain;
+  } finally {
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
+test("serializes concurrent replacement prompts for the same agent", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-concurrent-replacements-"));
+  const storage = new AgentStorage(join(workdir, "agents"), logger);
+
+  class ConcurrentReplacementSession extends SteeringTestSession {
+    override async startTurn(prompt: AgentPromptInput): Promise<{ turnId: string }> {
+      this.startPrompts.push(prompt);
+      return { turnId: `active-turn-${++this.startCount}` };
+    }
+  }
+
+  const session = new ConcurrentReplacementSession({ provider: "codex", cwd: workdir });
+  const manager = new AgentManager({
+    clients: {
+      codex: new (class extends TestAgentClient {
+        override async createSession(): Promise<AgentSession> {
+          return session;
+        }
+      })(),
+    },
+    registry: storage,
+    logger,
+    idFactory: () => "00000000-0000-4000-8000-000000000147",
+  });
+  let agentId: string | null = null;
+
+  try {
+    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    agentId = agent.id;
+    await startAgentRun(manager, agent.id, "initial", logger, { replaceRunning: true });
+    await manager.waitForAgentRunStart(agent.id);
+
+    const replacements = await Promise.all([
+      startAgentRun(manager, agent.id, "replacement one", logger, { replaceRunning: true }),
+      startAgentRun(manager, agent.id, "replacement two", logger, { replaceRunning: true }),
+    ]);
+
+    expect(replacements).toEqual([
+      { disposition: "turn_started" },
+      { disposition: "turn_started" },
+    ]);
+    await vi.waitFor(() => expect(session.startCount).toBe(3));
+    await vi.waitFor(() =>
+      expect(manager.getAgent(agent.id)?.activeForegroundTurnId).toBe("active-turn-3"),
+    );
+    await vi.waitFor(() => expect(manager.getAgent(agent.id)?.pendingReplacement).toBe(false));
+    expect(session.interruptCount).toBe(2);
+
+    session.pushEvent({
+      type: "turn_completed",
+      provider: session.provider,
+      turnId: "active-turn-3",
+    });
+    await vi.waitFor(() =>
+      expect(manager.getAgent(agent.id)).toMatchObject({
+        lifecycle: "idle",
+        activeForegroundTurnId: null,
+        pendingReplacement: false,
+      }),
+    );
+  } finally {
+    if (agentId) await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
 test("replaceAgentRun stays running when a stale old terminal arrives before the replacement turn is current", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-replace-stale-terminal-"));
   const storagePath = join(workdir, "agents");

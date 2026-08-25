@@ -123,7 +123,7 @@ type StoredAppSettings = z.infer<typeof StoredAppSettingsSchema>;
 export const DEFAULT_CLIENT_SETTINGS: AppSettings = {
   theme: "auto",
   language: "system",
-  sendBehavior: "interrupt",
+  sendBehavior: "steer",
   serviceUrlBehavior: "ask",
   terminalScrollbackLines: DEFAULT_TERMINAL_SCROLLBACK_LINES,
   useLegacyTerminalRenderer: false,

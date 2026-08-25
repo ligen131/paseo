@@ -100,6 +100,7 @@ import { useKeyboardShiftStyle } from "@/hooks/use-keyboard-shift-style";
 import { useKeyboardActionHandler } from "@/hooks/use-keyboard-action-handler";
 import type { KeyboardActionDefinition } from "@/keyboard/keyboard-action-dispatcher";
 import type { MessageInputKeyboardActionKind } from "@/keyboard/actions";
+import { resolveImmediateSendActiveTurnBehavior } from "@/composer/input/state";
 import { submitAgentInput } from "@/composer/submit";
 import { createMessageSubmissionWriter } from "@/composer/submission/writer";
 import { ComposerKeyboardScopeProvider, useComposerKeyboardScope } from "@/composer/keyboard-scope";
@@ -1422,7 +1423,7 @@ function ComposerContentImpl({
         agentIdRef.current,
         text,
         submitAttachments,
-        appSettings.sendBehavior === "steer" ? "steer" : "interrupt",
+        resolveImmediateSendActiveTurnBehavior(appSettings.sendBehavior),
       );
     },
     [appSettings.sendBehavior, cwd, onMessageSent, t],

@@ -2518,6 +2518,47 @@ describe("HostRuntimeStore", () => {
     useSessionStore.getState().clearSession(host.serverId);
   });
 
+  it("keeps a queued message when the latest agent state is running", () => {
+    const host = makeHost({ serverId: "srv_running_queue_drain" });
+    const fakeClient = new FakeDaemonClient();
+    const store = new HostRuntimeStore({
+      deps: {
+        createClient: () => fakeClient as unknown as DaemonClient,
+        connectToDaemon: async () => ({
+          client: fakeClient as unknown as DaemonClient,
+          serverId: host.serverId,
+          hostname: null,
+        }),
+        getClientId: async () => "cid_running_queue_drain",
+      },
+    });
+    const entry = makeFetchAgentsEntry({
+      id: "agent",
+      cwd: "/repo",
+      updatedAt: "2026-07-12T10:00:00.000Z",
+    });
+    const sessionStore = useSessionStore.getState();
+    sessionStore.initializeSession(host.serverId, fakeClient as unknown as DaemonClient, 1);
+    sessionStore.setAgents(
+      host.serverId,
+      new Map([
+        ["agent", { ...replicaAgent(entry.agent, host.serverId), status: "running" as const }],
+      ]),
+    );
+    sessionStore.setQueuedMessages(
+      host.serverId,
+      new Map([["agent", [{ id: "queued", text: "wait for idle", attachments: [] }]]]),
+    );
+
+    store.drainQueuedAgentMessage(host.serverId, "agent");
+
+    expect(fakeClient.sentAgentMessages).toEqual([]);
+    expect(useSessionStore.getState().sessions[host.serverId]?.queuedMessages.get("agent")).toEqual(
+      [{ id: "queued", text: "wait for idle", attachments: [] }],
+    );
+    sessionStore.clearSession(host.serverId);
+  });
+
   it("submits an automatically drained message through the submission producer", async () => {
     const host = makeHost({ serverId: "srv_drain_submission" });
     const fakeClient = new FakeDaemonClient();
@@ -2567,6 +2608,7 @@ describe("HostRuntimeStore", () => {
     store.drainQueuedAgentMessage(host.serverId, "agent");
     await fakeClient.waitForSentMessages(1);
 
+    expect(fakeClient.sentAgentMessages[0]?.[2]?.activeTurnBehavior).toBe("steer");
     // The row and the pending submission must exist while the RPC is still in flight —
     // the user sees their message and the working footer immediately, exactly as when
     // they press send.
