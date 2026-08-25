@@ -176,6 +176,43 @@ describe("projectTimelineRows", () => {
     expect(tool?.collapsed).toContain("tool_lifecycle");
   });
 
+  test("keeps reused tool call ids from different turns separate", () => {
+    const toolItem = (status: "running" | "completed") => ({
+      type: "tool_call" as const,
+      callId: "reused_call",
+      name: "shell",
+      status,
+      error: null,
+      detail: { type: "unknown" as const, input: {}, output: null },
+    });
+    const rows: AgentTimelineRow[] = [
+      {
+        seq: 1,
+        timestamp: "2026-02-13T00:00:00.000Z",
+        turnId: "turn-a",
+        item: toolItem("running"),
+      },
+      {
+        seq: 2,
+        timestamp: "2026-02-13T00:00:00.100Z",
+        turnId: "turn-b",
+        item: toolItem("running"),
+      },
+      {
+        seq: 3,
+        timestamp: "2026-02-13T00:00:00.200Z",
+        turnId: "turn-b",
+        item: toolItem("completed"),
+      },
+    ];
+
+    const projected = projectTimelineRows({ rows, mode: "projected" });
+
+    expect(projected).toHaveLength(3);
+    expect(projected.map((entry) => entry.turnId)).toEqual(["turn-a", "turn-b", "turn-b"]);
+    expect(projected.every((entry) => entry.collapsed.length === 0)).toBe(true);
+  });
+
   test("returns canonical rows unchanged in canonical mode", () => {
     const rows: AgentTimelineRow[] = [
       {

@@ -72,6 +72,25 @@ describe("FileAgentTimelineStore", () => {
     expect((await reopened.fetchCommitted("agent", { limit: 0 })).window.nextSeq).toBe(8);
   });
 
+  it("shares immutable item payloads only when requested for live timeline seeding", async () => {
+    const store = new FileAgentTimelineStore(await storeDirectory());
+    const row: AgentTimelineRow & { ignored: string } = {
+      seq: 1,
+      timestamp: "2026-01-01T00:00:00.000Z",
+      item: { type: "assistant_message", text: "large payload" },
+      ignored: "not persisted",
+    };
+    await store.replaceCommittedSnapshot("agent", { rows: [row], historyComplete: true });
+
+    const copied = await store.getCommittedSnapshot("agent");
+    const shared = await store.getCommittedSnapshot("agent", { shareItems: true });
+
+    expect(copied.rows[0]?.item).not.toBe(row.item);
+    expect(shared.rows[0]?.item).toBe(row.item);
+    expect(shared.rows[0]).not.toHaveProperty("ignored");
+    expect(shared).toEqual(copied);
+  });
+
   it("treats duplicate supplied rows as idempotent and rejects conflicting sequence reuse", async () => {
     const directory = await storeDirectory();
     let writeCount = 0;

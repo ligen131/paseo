@@ -38,6 +38,11 @@ export interface AgentTimelineSnapshot {
   historyComplete: boolean;
 }
 
+export interface AgentTimelineSnapshotOptions {
+  /** Share immutable item payloads with the store instead of deep-cloning the full transcript. */
+  shareItems?: boolean;
+}
+
 export interface AgentTimelineFetchResult {
   epoch: string;
   direction: AgentTimelineFetchDirection;
@@ -62,7 +67,10 @@ export interface AgentTimelineStore {
   ): Promise<AgentTimelineFetchResult>;
   getLatestCommittedSeq(agentId: string): Promise<number>;
   getCommittedRows(agentId: string): Promise<AgentTimelineRow[]>;
-  getCommittedSnapshot(agentId: string): Promise<AgentTimelineSnapshot>;
+  getCommittedSnapshot(
+    agentId: string,
+    options?: AgentTimelineSnapshotOptions,
+  ): Promise<AgentTimelineSnapshot>;
   getLastItem(agentId: string): Promise<AgentTimelineItem | null>;
   getLastAssistantMessage(agentId: string): Promise<string | null>;
   deleteAgent(agentId: string): Promise<void>;

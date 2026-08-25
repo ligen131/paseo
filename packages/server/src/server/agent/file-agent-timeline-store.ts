@@ -4,7 +4,6 @@ import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { z } from "zod";
 
-import { writeJsonFileAtomic } from "../atomic-file.js";
 import type { AgentTimelineItem } from "./agent-sdk-types.js";
 import { InMemoryAgentTimelineStore } from "./agent-timeline-store.js";
 import { AgentTimelineItemPayloadSchema } from "@getpaseo/protocol/messages";
@@ -13,6 +12,7 @@ import type {
   AgentTimelineFetchResult,
   AgentTimelineRow,
   AgentTimelineSnapshot,
+  AgentTimelineSnapshotOptions,
   AgentTimelineStore,
 } from "./agent-timeline-store-types.js";
 
@@ -32,11 +32,18 @@ const TimelineDocumentSchema = z.object({
   // Documents written before history completeness existed are intentionally incomplete.
   historyComplete: z.boolean().optional().default(false),
 });
+const TimelineDocumentEnvelopeSchema = TimelineDocumentSchema.extend({
+  rows: z.array(z.unknown()),
+});
 
 type TimelineDocument = z.infer<typeof TimelineDocumentSchema>;
 
 export interface FileAgentTimelineStoreOptions {
-  writeJson?: (filePath: string, value: unknown) => Promise<void>;
+  writeJson?: (filePath: string, value: TimelineDocument) => Promise<void>;
+}
+
+function shareRow(row: AgentTimelineRow): AgentTimelineRow {
+  return { ...row };
 }
 
 function cloneRow(row: AgentTimelineRow): AgentTimelineRow {
@@ -44,11 +51,10 @@ function cloneRow(row: AgentTimelineRow): AgentTimelineRow {
 }
 
 function cloneDocument(document: TimelineDocument): TimelineDocument {
-  return { ...document, rows: document.rows.map(cloneRow) };
+  return { ...document, rows: document.rows.map(shareRow) };
 }
 
-function validateDocument(value: unknown): TimelineDocument {
-  const document = TimelineDocumentSchema.parse(value);
+function assertDocumentInvariants(document: TimelineDocument): void {
   let previousSeq = 0;
   for (const row of document.rows) {
     if (row.seq <= previousSeq) {
@@ -59,6 +65,29 @@ function validateDocument(value: unknown): TimelineDocument {
   if (document.nextSeq <= previousSeq) {
     throw new Error("Timeline nextSeq must be greater than every row sequence number");
   }
+}
+
+function validateAndShareRow(value: unknown): AgentTimelineRow {
+  const parsed = TimelineRowSchema.parse(value);
+  // Zod clones successful parses. Keep the validated source item so one large
+  // transcript does not remain resident as two equivalent object graphs.
+  const source = value as { item: AgentTimelineItem };
+  return {
+    seq: parsed.seq,
+    timestamp: parsed.timestamp,
+    item: source.item,
+    ...(parsed.turnId !== undefined ? { turnId: parsed.turnId } : {}),
+    ...(parsed.providerMessageId !== undefined
+      ? { providerMessageId: parsed.providerMessageId }
+      : {}),
+  };
+}
+
+function parseDocument(value: unknown): TimelineDocument {
+  const envelope = TimelineDocumentEnvelopeSchema.parse(value);
+  const rows = envelope.rows.map(validateAndShareRow);
+  const document: TimelineDocument = { ...envelope, rows };
+  assertDocumentInvariants(document);
   return document;
 }
 
@@ -68,6 +97,50 @@ function emptyDocument(): TimelineDocument {
 
 function fileNameForAgent(agentId: string): string {
   return `agent-${Buffer.from(agentId, "utf8").toString("base64url")}.json`;
+}
+
+const TIMELINE_WRITE_CHUNK_LENGTH = 1024 * 1024;
+
+async function writeTimelineDocumentAtomic(
+  filePath: string,
+  document: TimelineDocument,
+): Promise<void> {
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  const tempPath = path.join(
+    path.dirname(filePath),
+    `.${path.basename(filePath)}.${process.pid}.${Date.now()}.${randomUUID()}.tmp`,
+  );
+  let handle: Awaited<ReturnType<typeof fs.open>> | null = null;
+  try {
+    handle = await fs.open(tempPath, "wx", 0o600);
+    let chunk = `{
+  "version": 1,
+  "epoch": ${JSON.stringify(document.epoch)},
+  "nextSeq": ${document.nextSeq},
+  "rows": [`;
+    for (let index = 0; index < document.rows.length; index += 1) {
+      const row = JSON.stringify(document.rows[index]!);
+      const entry = `${index === 0 ? "\n" : ",\n"}    ${row}`;
+      if (chunk.length > 0 && chunk.length + entry.length > TIMELINE_WRITE_CHUNK_LENGTH) {
+        await handle.writeFile(chunk, "utf8");
+        chunk = "";
+      }
+      chunk += entry;
+    }
+    chunk += `
+  ],
+  "historyComplete": ${document.historyComplete}
+}
+`;
+    await handle.writeFile(chunk, "utf8");
+    await handle.close();
+    handle = null;
+    await fs.rename(tempPath, filePath);
+  } catch (error) {
+    await handle?.close().catch(() => undefined);
+    await fs.rm(tempPath, { force: true });
+    throw error;
+  }
 }
 
 function selectRows(
@@ -84,13 +157,13 @@ export class FileAgentTimelineStore implements AgentTimelineStore {
   private readonly documents = new Map<string, TimelineDocument>();
   private readonly loading = new Map<string, Promise<TimelineDocument>>();
   private readonly mutationTails = new Map<string, Promise<void>>();
-  private readonly writeJson: (filePath: string, value: unknown) => Promise<void>;
+  private readonly writeJson: (filePath: string, value: TimelineDocument) => Promise<void>;
 
   constructor(
     private readonly directory: string,
     options?: FileAgentTimelineStoreOptions,
   ) {
-    this.writeJson = options?.writeJson ?? writeJsonFileAtomic;
+    this.writeJson = options?.writeJson ?? writeTimelineDocumentAtomic;
   }
 
   async appendCommitted(
@@ -99,12 +172,12 @@ export class FileAgentTimelineStore implements AgentTimelineStore {
     options?: { timestamp?: string; turnId?: string },
   ): Promise<AgentTimelineRow> {
     return this.mutate(agentId, (document) => {
-      const row: AgentTimelineRow = {
+      const row = TimelineRowSchema.parse({
         seq: document.nextSeq,
         timestamp: options?.timestamp ?? new Date().toISOString(),
-        item: structuredClone(item),
+        item,
         ...(options?.turnId ? { turnId: options.turnId } : {}),
-      };
+      });
       document.rows.push(row);
       document.nextSeq += 1;
       return cloneRow(row);
@@ -126,9 +199,15 @@ export class FileAgentTimelineStore implements AgentTimelineStore {
     return (await this.getDocument(agentId)).rows.map(cloneRow);
   }
 
-  async getCommittedSnapshot(agentId: string): Promise<AgentTimelineSnapshot> {
+  async getCommittedSnapshot(
+    agentId: string,
+    options?: AgentTimelineSnapshotOptions,
+  ): Promise<AgentTimelineSnapshot> {
     const document = await this.getDocument(agentId);
-    return { rows: document.rows.map(cloneRow), historyComplete: document.historyComplete };
+    return {
+      rows: document.rows.map(options?.shareItems ? shareRow : cloneRow),
+      historyComplete: document.historyComplete,
+    };
   }
 
   async getLastItem(agentId: string): Promise<AgentTimelineItem | null> {
@@ -163,22 +242,22 @@ export class FileAgentTimelineStore implements AgentTimelineStore {
       const proposed = cloneDocument(current);
       let changed = false;
       for (const row of rows) {
-        const parsed = TimelineRowSchema.parse(row);
-        const existing = proposed.rows.find((candidate) => candidate.seq === parsed.seq);
+        const validated = validateAndShareRow(row);
+        const existing = proposed.rows.find((candidate) => candidate.seq === validated.seq);
         if (existing) {
-          if (!isDeepStrictEqual(existing, parsed)) {
-            throw new Error(`Conflicting timeline row sequence ${parsed.seq}`);
+          if (!isDeepStrictEqual(existing, validated)) {
+            throw new Error(`Conflicting timeline row sequence ${validated.seq}`);
           }
           continue;
         }
-        proposed.rows.push(cloneRow(parsed));
+        proposed.rows.push(validated);
         changed = true;
       }
       if (!changed) return;
       proposed.rows.sort((left, right) => left.seq - right.seq);
       const maxSeq = proposed.rows.at(-1)?.seq ?? 0;
       proposed.nextSeq = Math.max(proposed.nextSeq, maxSeq + 1);
-      validateDocument(proposed);
+      assertDocumentInvariants(proposed);
       await this.writeJson(this.filePath(agentId), proposed);
       this.documents.set(agentId, proposed);
     });
@@ -187,7 +266,7 @@ export class FileAgentTimelineStore implements AgentTimelineStore {
   async replaceCommittedSnapshot(agentId: string, snapshot: AgentTimelineSnapshot): Promise<void> {
     await this.runMutation(agentId, async () => {
       const current = await this.getDocument(agentId);
-      const rows = snapshot.rows.map((row) => cloneRow(TimelineRowSchema.parse(row)));
+      const rows = snapshot.rows.map(validateAndShareRow);
       const nextSeq = (rows.at(-1)?.seq ?? 0) + 1;
       const proposed: TimelineDocument = {
         version: 1,
@@ -196,7 +275,7 @@ export class FileAgentTimelineStore implements AgentTimelineStore {
         rows,
         historyComplete: snapshot.historyComplete,
       };
-      validateDocument(proposed);
+      assertDocumentInvariants(proposed);
       await this.writeJson(this.filePath(agentId), proposed);
       this.documents.set(agentId, proposed);
     });
@@ -209,7 +288,7 @@ export class FileAgentTimelineStore implements AgentTimelineStore {
       if (index < 0) {
         throw new Error(`Cannot update missing timeline row sequence ${parsed.seq}`);
       }
-      document.rows[index] = cloneRow(parsed);
+      document.rows[index] = parsed;
     });
   }
 
@@ -221,7 +300,7 @@ export class FileAgentTimelineStore implements AgentTimelineStore {
       const current = await this.getDocument(agentId);
       const proposed = cloneDocument(current);
       const result = mutation(proposed);
-      validateDocument(proposed);
+      assertDocumentInvariants(proposed);
       await this.writeJson(this.filePath(agentId), proposed);
       this.documents.set(agentId, proposed);
       return result;
@@ -247,7 +326,7 @@ export class FileAgentTimelineStore implements AgentTimelineStore {
 
   private async loadDocument(agentId: string): Promise<TimelineDocument> {
     try {
-      return validateDocument(JSON.parse(await fs.readFile(this.filePath(agentId), "utf8")));
+      return parseDocument(JSON.parse(await fs.readFile(this.filePath(agentId), "utf8")));
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return emptyDocument();
       throw error;

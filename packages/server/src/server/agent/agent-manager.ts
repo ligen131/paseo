@@ -1146,9 +1146,6 @@ export class AgentManager {
 
   async getTimelineRows(id: string): Promise<AgentTimelineRow[]> {
     this.requireAgent(id);
-    if (this.durableTimelineStore) {
-      return await this.durableTimelineStore.getCommittedRows(id);
-    }
     return this.timelineStore.getRows(id);
   }
 
@@ -3398,7 +3395,9 @@ export class AgentManager {
       return { timestamp: now.toISOString() };
     }
 
-    const snapshot = await this.durableTimelineStore.getCommittedSnapshot(agentId);
+    const snapshot = await this.durableTimelineStore.getCommittedSnapshot(agentId, {
+      shareItems: true,
+    });
     const rows = snapshot.rows;
     return {
       rows,

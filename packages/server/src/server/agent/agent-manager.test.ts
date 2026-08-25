@@ -55,9 +55,11 @@ const MOBILE_OPEN_AGENT_TAB_LABEL = getOpenAgentTabLabel("mobile-client");
 test("marks a fresh agent canonical timeline complete", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-fresh-complete-"));
   const timelineDirectory = join(workdir, "agent-timelines");
+  const durableTimelineStore = new FileAgentTimelineStore(timelineDirectory);
+  const getCommittedSnapshot = vi.spyOn(durableTimelineStore, "getCommittedSnapshot");
   const manager = new AgentManager({
     clients: { codex: new TestAgentClient() },
-    durableTimelineStore: new FileAgentTimelineStore(timelineDirectory),
+    durableTimelineStore,
     logger,
   });
   let agentId: string | null = null;
@@ -66,6 +68,7 @@ test("marks a fresh agent canonical timeline complete", async () => {
       workspaceId: undefined,
     });
     agentId = agent.id;
+    expect(getCommittedSnapshot).toHaveBeenCalledWith(agent.id, { shareItems: true });
     expect(
       await new FileAgentTimelineStore(timelineDirectory).getCommittedSnapshot(agent.id),
     ).toEqual({ rows: [], historyComplete: true });
@@ -5657,6 +5660,36 @@ test("getTimelineRows falls back to the in-memory timeline when no durable store
       },
     },
   ]);
+});
+
+test("getTimelineRows reads the live timeline without deep-cloning the durable document", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-live-timeline-rows-"));
+  const durableTimelineStore = new FileAgentTimelineStore(join(workdir, "timelines"));
+  const getCommittedRows = vi.spyOn(durableTimelineStore, "getCommittedRows");
+  const manager = new AgentManager({
+    clients: { codex: new TestAgentClient() },
+    durableTimelineStore,
+    logger,
+  });
+  let agentId: string | null = null;
+  try {
+    const agent = await manager.createAgent({ provider: "codex", cwd: workdir }, undefined, {
+      workspaceId: undefined,
+    });
+    agentId = agent.id;
+    await manager.appendTimelineItem(agent.id, {
+      type: "assistant_message",
+      text: "live row",
+    });
+
+    await expect(manager.getTimelineRows(agent.id)).resolves.toMatchObject([
+      { item: { type: "assistant_message", text: "live row" } },
+    ]);
+    expect(getCommittedRows).not.toHaveBeenCalled();
+  } finally {
+    if (agentId) await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
 });
 
 test("getAgent does not expose committed history internals once manager owns the seam", async () => {
