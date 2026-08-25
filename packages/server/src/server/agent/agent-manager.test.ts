@@ -225,6 +225,77 @@ test("reconciles provider history whenever a persisted agent starts a new runtim
   }
 });
 
+test("yields the event loop while hydrating a large provider history", async () => {
+  const workdir = mkdtempSync(join(tmpdir(), "agent-manager-history-yield-"));
+  let immediateRan = false;
+  let observedImmediateDuringHistory = false;
+  let appendAfterHistory = (): void => undefined;
+  let concurrentAppend: Promise<void> | undefined;
+
+  class LargeHistorySession extends TestAgentSession {
+    override async *streamHistory(): AsyncGenerator<AgentStreamEvent> {
+      for (let index = 0; index < 1_024; index += 1) {
+        if (immediateRan) observedImmediateDuringHistory = true;
+        yield {
+          type: "timeline",
+          provider: "codex",
+          item: { type: "assistant_message", text: `history-${index}` },
+        };
+      }
+      setImmediate(appendAfterHistory);
+    }
+  }
+  class LargeHistoryClient extends TestAgentClient {
+    override async resumeSession(
+      _handle: AgentPersistenceHandle,
+      config?: Partial<AgentSessionConfig>,
+    ): Promise<AgentSession> {
+      return new LargeHistorySession({ provider: "codex", cwd: config?.cwd ?? workdir });
+    }
+  }
+
+  const manager = new AgentManager({
+    clients: { codex: new LargeHistoryClient() },
+    logger,
+  });
+  let agentId: string | null = null;
+  try {
+    const agent = await manager.resumeAgentFromPersistence(
+      {
+        provider: "codex",
+        sessionId: "large-history",
+        metadata: { cwd: workdir },
+      },
+      { cwd: workdir },
+    );
+    agentId = agent.id;
+    appendAfterHistory = () => {
+      concurrentAppend = manager.appendTimelineItem(agent.id, {
+        type: "assistant_message",
+        text: "concurrent-timeline-item",
+      });
+    };
+    setImmediate(() => {
+      immediateRan = true;
+    });
+
+    await manager.hydrateTimelineFromProvider(agent.id);
+    expect(concurrentAppend).toBeDefined();
+    await concurrentAppend;
+
+    expect(observedImmediateDuringHistory).toBe(true);
+    const rows = manager.fetchTimeline(agent.id, { limit: 0 }).rows;
+    expect(rows).toHaveLength(1_025);
+    expect(rows.at(-1)?.item).toEqual({
+      type: "assistant_message",
+      text: "concurrent-timeline-item",
+    });
+  } finally {
+    if (agentId) await manager.closeAgent(agentId).catch(() => undefined);
+    rmSync(workdir, { recursive: true, force: true });
+  }
+});
+
 test("retains a canonical steer when incomplete provider history lags on reopen", async () => {
   const workdir = mkdtempSync(join(tmpdir(), "agent-manager-lagging-history-"));
   const storage = new AgentStorage(join(workdir, "agents"), logger);

@@ -81,6 +81,7 @@ import {
 
 const RELOAD_SESSION_CLOSE_TIMEOUT_MS = 3_000;
 const INTERRUPT_SESSION_TIMEOUT_MS = 2_000;
+const HISTORY_HYDRATION_YIELD_INTERVAL = 256;
 const STORED_AGENT_CAPABILITIES: AgentCapabilityFlags = {
   supportsStreaming: false,
   supportsSessionPersistence: true,
@@ -144,6 +145,58 @@ interface TimeoutOptions {
 
 function formatProviderList(providers: readonly string[]): string {
   return providers.length > 0 ? providers.join(", ") : "none";
+}
+
+function yieldToEventLoop(): Promise<void> {
+  return new Promise((resolvePromise) => setImmediate(resolvePromise));
+}
+
+/** Preserves timeline writes that land while provider reconciliation yields to the event loop. */
+function preserveConcurrentTimelineChanges(
+  reconciledRows: AgentTimelineRow[],
+  baselineRows: readonly AgentTimelineRow[],
+  currentRows: readonly AgentTimelineRow[],
+): AgentTimelineRow[] {
+  const baselineProviderMessageIds = new Map<string, string | undefined>();
+  for (const row of baselineRows) {
+    if (row.item.type === "user_message" && row.item.clientMessageId) {
+      baselineProviderMessageIds.set(row.item.clientMessageId, row.providerMessageId);
+    }
+  }
+
+  const providerMessageIdUpdates = new Map<string, string>();
+  for (const row of currentRows) {
+    if (
+      row.item.type === "user_message" &&
+      row.item.clientMessageId &&
+      row.providerMessageId &&
+      baselineProviderMessageIds.get(row.item.clientMessageId) !== row.providerMessageId
+    ) {
+      providerMessageIdUpdates.set(row.item.clientMessageId, row.providerMessageId);
+    }
+  }
+
+  const baselineMaxSeq = baselineRows[baselineRows.length - 1]?.seq ?? 0;
+  const appendedRows = currentRows.filter((row) => row.seq > baselineMaxSeq);
+  if (providerMessageIdUpdates.size === 0 && appendedRows.length === 0) {
+    return reconciledRows;
+  }
+
+  for (let index = 0; index < reconciledRows.length; index += 1) {
+    const row = reconciledRows[index]!;
+    if (row.item.type !== "user_message" || !row.item.clientMessageId) continue;
+    const providerMessageId = providerMessageIdUpdates.get(row.item.clientMessageId);
+    if (providerMessageId) {
+      reconciledRows[index] = { ...row, providerMessageId };
+    }
+  }
+  for (const row of appendedRows) {
+    reconciledRows.push({ ...row });
+  }
+  for (let index = 0; index < reconciledRows.length; index += 1) {
+    reconciledRows[index]!.seq = index + 1;
+  }
+  return reconciledRows;
 }
 
 function buildStoredAgentConfig(record: StoredAgentRecord): AgentSessionConfig {
@@ -3655,7 +3708,12 @@ export class AgentManager {
   ): Promise<void> {
     const historyEvents: Extract<AgentStreamEvent, { type: "timeline" }>[] = [];
     const providerSubagentEvents: Extract<AgentStreamEvent, { type: "provider_subagent" }>[] = [];
+    let processedEvents = 0;
     for await (const rawEvent of agent.session.streamHistory()) {
+      processedEvents += 1;
+      if (processedEvents % HISTORY_HYDRATION_YIELD_INTERVAL === 0) {
+        await yieldToEventLoop();
+      }
       const event = limitAgentStreamEventContent(rawEvent);
       if (event.type === "timeline") {
         if (event.item.type === "user_message" && isSystemInjectedEnvelope(event.item.text)) {
@@ -3667,7 +3725,7 @@ export class AgentManager {
       }
     }
 
-    const reconciledRows = reconcileProviderHistory(
+    const reconciledRows = await reconcileProviderHistory(
       this.timelineStore.getRows(agent.id),
       historyEvents.map((event) => ({ item: event.item, timestamp: event.timestamp })),
       { mode: "force" },
@@ -3708,8 +3766,13 @@ export class AgentManager {
     const providerSubagentEvents: AgentManagerEvent[] = [];
     const historyEvents: Extract<AgentStreamEvent, { type: "timeline" }>[] = [];
     agent.historyPrimed = false;
+    let processedEvents = 0;
     try {
       for await (const rawEvent of agent.session.streamHistory()) {
+        processedEvents += 1;
+        if (processedEvents % HISTORY_HYDRATION_YIELD_INTERVAL === 0) {
+          await yieldToEventLoop();
+        }
         const event = limitAgentStreamEventContent(rawEvent);
         if (event.type === "provider_subagent") {
           const update = this.providerSubagents.apply(agent.id, event.provider, event.event);
@@ -3730,9 +3793,15 @@ export class AgentManager {
         historyEvents.push(event);
       }
 
-      const reconciledRows = reconcileProviderHistory(
-        this.timelineStore.getRows(agent.id),
+      const canonicalRows = this.timelineStore.getRows(agent.id);
+      let reconciledRows = await reconcileProviderHistory(
+        canonicalRows,
         historyEvents.map((event) => ({ item: event.item, timestamp: event.timestamp })),
+      );
+      reconciledRows = preserveConcurrentTimelineChanges(
+        reconciledRows,
+        canonicalRows,
+        this.timelineStore.getRows(agent.id),
       );
       this.timelineStore.initialize(agent.id, { rows: reconciledRows });
       if (deferredBroadcast) {
