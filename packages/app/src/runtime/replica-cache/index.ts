@@ -70,6 +70,12 @@ const StoredTimelineItemSchema = z.discriminatedUnion("kind", [
   }),
   z.strictObject({
     ...TimelineItemBaseShape,
+    kind: z.literal("system_message"),
+    text: z.string(),
+    level: z.enum(["info", "notice", "suggestion", "warning"]),
+  }),
+  z.strictObject({
+    ...TimelineItemBaseShape,
     kind: z.literal("thought"),
     text: z.string(),
     status: z.enum(["loading", "ready"]),
@@ -347,6 +353,8 @@ function serializeTimelineItem(item: StreamItem): StoredTimelineItem | null {
         ...(item.blockGroupId ? { blockGroupId: item.blockGroupId } : {}),
         ...(item.blockIndex !== undefined ? { blockIndex: item.blockIndex } : {}),
       };
+    case "system_message":
+      return { ...base, kind: item.kind, text: item.text, level: item.level };
     case "thought":
       return { ...base, kind: item.kind, text: item.text, status: item.status };
     case "todo_list":
@@ -418,6 +426,8 @@ function deserializeTimelineItem(item: StoredTimelineItem): StreamItem {
         ...(item.blockGroupId ? { blockGroupId: item.blockGroupId } : {}),
         ...(item.blockIndex !== undefined ? { blockIndex: item.blockIndex } : {}),
       };
+    case "system_message":
+      return { ...base, kind: item.kind, text: item.text, level: item.level };
     case "thought":
       return { ...base, kind: item.kind, text: item.text, status: item.status };
     case "todo_list":

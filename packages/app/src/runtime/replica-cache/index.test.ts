@@ -111,6 +111,18 @@ function message(id: string, text: string): StreamItem {
   };
 }
 
+function systemMessage(): StreamItem {
+  return {
+    kind: "system_message",
+    id: "system-1",
+    turnId: "turn-1",
+    timelineCursor: { epoch: "epoch-1", seq: 12 },
+    timestamp: new Date("2026-07-18T08:02:00.000Z"),
+    text: "Archived output: https://example.com/session",
+    level: "notice",
+  };
+}
+
 function toolCall(): StreamItem {
   return {
     kind: "tool_call",
@@ -330,6 +342,30 @@ describe("ReplicaCache", () => {
 
     const session = useSessionStore.getState().sessions[SERVER_ID];
     expect(session?.agentStreamTail.get("agent-1")).toEqual([toolCall()]);
+    expect(session?.agentTimelineCursor.get("agent-1")).toEqual({
+      epoch: "epoch-1",
+      startSeq: 1,
+      endSeq: 12,
+    });
+  });
+
+  it("restores system messages inside an authoritative cached window", async () => {
+    const storage = new MemoryStorage();
+    const writer = new ReplicaCache(storage);
+    writer.setHosts([SERVER_ID]);
+    seedSession();
+    useSessionStore
+      .getState()
+      .setAgentStreamTail(SERVER_ID, new Map([["agent-1", [systemMessage()]]]));
+    await writer.flush();
+
+    useSessionStore.getState().clearSession(SERVER_ID);
+    const reader = new ReplicaCache(storage);
+    reader.setHosts([SERVER_ID]);
+    await reader.restore();
+
+    const session = useSessionStore.getState().sessions[SERVER_ID];
+    expect(session?.agentStreamTail.get("agent-1")).toEqual([systemMessage()]);
     expect(session?.agentTimelineCursor.get("agent-1")).toEqual({
       epoch: "epoch-1",
       startSeq: 1,

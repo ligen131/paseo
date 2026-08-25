@@ -333,6 +333,42 @@ describe("convertClaudeHistoryEntry", () => {
     ]);
   });
 
+  test("maps informational system records to synthetic tool calls", () => {
+    const entry = {
+      type: "system",
+      subtype: "informational",
+      uuid: "informational-history-1",
+      content: "Archived output: https://example.com/session",
+      level: "notice",
+      tool_use_id: "toolu-history-1",
+      prevent_continuation: false,
+    };
+    const mapBlocks = vi.fn().mockReturnValue([]);
+
+    expect(convertClaudeHistoryEntry(entry, mapBlocks)).toEqual([
+      {
+        type: "tool_call",
+        callId: "claude_informational_informational-history-1",
+        name: "claude_informational",
+        status: "completed",
+        error: null,
+        detail: {
+          type: "plain_text",
+          label: "Claude notice",
+          text: entry.content,
+        },
+        metadata: {
+          synthetic: true,
+          source: "claude_informational",
+          level: "notice",
+          toolUseId: "toolu-history-1",
+          preventContinuation: false,
+        },
+      },
+    ]);
+    expect(mapBlocks).not.toHaveBeenCalled();
+  });
+
   test("maps queue-operation task notifications to synthetic tool calls", () => {
     const entry = {
       type: "queue-operation",
@@ -1402,6 +1438,115 @@ describe("ClaudeAgentClient.listImportableSessions", () => {
       await fs.rm(tmpConfigDir, { recursive: true, force: true });
     }
   });
+});
+
+describe("ClaudeAgentSession informational system messages", () => {
+  const logger = createTestLogger();
+
+  async function createSessionForTest(): Promise<TestClaudeSession> {
+    const client = new ClaudeAgentClient({ logger, resolveBinary: async () => "/test/claude/bin" });
+    const session = await client.createSession({
+      provider: "claude",
+      cwd: process.cwd(),
+    });
+    return session as unknown as TestClaudeSession;
+  }
+
+  test("emits notice content and diagnostic metadata without an assistant message", async () => {
+    const session = await createSessionForTest();
+    try {
+      const events = session.translateMessageToEvents({
+        type: "system",
+        subtype: "informational",
+        content: "Current turn: https://example.com/turn",
+        level: "notice",
+        tool_use_id: "toolu-stop-hook-1",
+        prevent_continuation: true,
+        uuid: "informational-live-1",
+        session_id: "session-1",
+      } as unknown as SDKMessage);
+
+      expect(events).toEqual([
+        {
+          type: "timeline",
+          provider: "claude",
+          item: {
+            type: "tool_call",
+            callId: "claude_informational_informational-live-1",
+            name: "claude_informational",
+            status: "completed",
+            error: null,
+            detail: {
+              type: "plain_text",
+              label: "Claude notice",
+              text: "Current turn: https://example.com/turn",
+            },
+            metadata: {
+              synthetic: true,
+              source: "claude_informational",
+              level: "notice",
+              toolUseId: "toolu-stop-hook-1",
+              preventContinuation: true,
+            },
+          },
+        },
+      ]);
+      expect(
+        events.some(
+          (event) => event.type === "timeline" && event.item.type === "assistant_message",
+        ),
+      ).toBe(false);
+    } finally {
+      await session.close();
+    }
+  });
+
+  test.each([
+    ["info", "Claude information"],
+    ["suggestion", "Claude suggestion"],
+    ["warning", "Claude warning"],
+  ] as const)(
+    "emits %s content when optional diagnostic metadata is absent",
+    async (level, label) => {
+      const session = await createSessionForTest();
+      try {
+        const events = session.translateMessageToEvents({
+          type: "system",
+          subtype: "informational",
+          content: `Claude ${level} message`,
+          level,
+          uuid: `informational-live-${level}-1`,
+          session_id: "session-1",
+        } as unknown as SDKMessage);
+
+        expect(events).toEqual([
+          {
+            type: "timeline",
+            provider: "claude",
+            item: {
+              type: "tool_call",
+              callId: `claude_informational_informational-live-${level}-1`,
+              name: "claude_informational",
+              status: "completed",
+              error: null,
+              detail: {
+                type: "plain_text",
+                label,
+                text: `Claude ${level} message`,
+              },
+              metadata: {
+                synthetic: true,
+                source: "claude_informational",
+                level,
+              },
+            },
+          },
+        ]);
+      } finally {
+        await session.close();
+      }
+    },
+  );
 });
 
 describe("ClaudeAgentSession context window usage", () => {

@@ -1,3 +1,4 @@
+import { Alert } from "@/components/ui/alert";
 import { LoadingSpinner } from "@/components/ui/loading-spinner";
 import { TaskListRow } from "@/components/task-list-row";
 import {
@@ -63,7 +64,12 @@ import Svg, { Defs, LinearGradient as SvgLinearGradient, Rect, Stop } from "reac
 import { CODE_SURFACE_DATASET } from "@/styles/code-surface";
 import { inlineUnistylesStyle } from "@/styles/unistyles-inline-style";
 import { MarkdownRenderer, type MarkdownStyles } from "@/components/markdown/renderer";
-import type { TaskActivity, TodoEntry, UserMessageImageAttachment } from "@/types/stream";
+import type {
+  SystemMessageLevel,
+  TaskActivity,
+  TodoEntry,
+  UserMessageImageAttachment,
+} from "@/types/stream";
 import type { AgentAttachment } from "@getpaseo/protocol/messages";
 import type { ToolCallDetail } from "@getpaseo/protocol/agent-types";
 import { buildToolCallPresentation } from "@/tool-calls/presentation";
@@ -1987,6 +1993,25 @@ export const SpeakMessage = memo(function SpeakMessage({
       </View>
       <Text style={speakMessageStylesheet.text}>{message}</Text>
     </View>
+  );
+});
+
+interface SystemMessageProps {
+  message: string;
+  level: SystemMessageLevel;
+}
+
+export const SystemMessage = memo(function SystemMessage({ message, level }: SystemMessageProps) {
+  const description = useMemo(
+    () => <MarkdownRenderer text={message} compact enableHtmlish={false} />,
+    [message],
+  );
+  return (
+    <Alert
+      variant={level === "warning" ? "warning" : "default"}
+      description={description}
+      testID="system-message"
+    />
   );
 });
 

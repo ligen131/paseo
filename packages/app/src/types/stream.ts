@@ -75,6 +75,7 @@ function createAssistantItemId(
 export type StreamItem =
   | UserMessageItem
   | AssistantMessageItem
+  | SystemMessageItem
   | ThoughtItem
   | ToolCallItem
   | TodoListItem
@@ -687,6 +688,18 @@ export interface AssistantMessageItem {
   blockIndex?: number;
 }
 
+export type SystemMessageLevel = "info" | "notice" | "suggestion" | "warning";
+
+export interface SystemMessageItem {
+  kind: "system_message";
+  id: string;
+  turnId?: string;
+  timelineCursor?: TimelinePosition;
+  text: string;
+  level: SystemMessageLevel;
+  timestamp: Date;
+}
+
 export interface TimelinePosition {
   epoch: string;
   seq: number;
@@ -804,6 +817,43 @@ interface StreamUpdateOptions {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+interface ClaudeInformationalProjection {
+  id: string;
+  text: string;
+  level: SystemMessageLevel;
+}
+
+function isSystemMessageLevel(value: unknown): value is SystemMessageLevel {
+  return value === "info" || value === "notice" || value === "suggestion" || value === "warning";
+}
+
+function readClaudeInformationalToolCall(
+  event: Extract<AgentStreamEventPayload, { type: "timeline" }>,
+): ClaudeInformationalProjection | null {
+  const item = event.item;
+  if (
+    event.provider !== "claude" ||
+    item.type !== "tool_call" ||
+    item.name !== "claude_informational" ||
+    item.status !== "completed" ||
+    item.error !== null ||
+    item.detail.type !== "plain_text" ||
+    typeof item.detail.text !== "string" ||
+    !isRecord(item.metadata) ||
+    item.metadata.synthetic !== true ||
+    item.metadata.source !== "claude_informational" ||
+    !isSystemMessageLevel(item.metadata.level)
+  ) {
+    return null;
+  }
+
+  return {
+    id: `agent_system_${item.callId}`,
+    text: item.detail.text,
+    level: item.metadata.level,
+  };
 }
 
 function normalizeChunk(text: string): { chunk: string; hasContent: boolean } {
@@ -1187,6 +1237,36 @@ function appendActivityLog(state: StreamItem[], entry: ActivityLogItem): StreamI
   return [...state, entry];
 }
 
+function appendSystemMessage(
+  state: StreamItem[],
+  projection: ClaudeInformationalProjection,
+  timestamp: Date,
+  timelineCursor?: TimelinePosition,
+): StreamItem[] {
+  const existingIndex = state.findIndex(
+    (item) => item.kind === "system_message" && item.id === projection.id,
+  );
+  const existing = state[existingIndex];
+  const existingSystemMessage = existing?.kind === "system_message" ? existing : null;
+  const resolvedTimelineCursor = timelineCursor ?? existingSystemMessage?.timelineCursor;
+  const message: SystemMessageItem = {
+    kind: "system_message",
+    id: projection.id,
+    ...(existingSystemMessage?.turnId ? { turnId: existingSystemMessage.turnId } : {}),
+    ...(resolvedTimelineCursor ? { timelineCursor: resolvedTimelineCursor } : {}),
+    timestamp,
+    text: projection.text,
+    level: projection.level,
+  };
+
+  if (existingIndex < 0) {
+    return [...state, message];
+  }
+  const next = [...state];
+  next[existingIndex] = message;
+  return next;
+}
+
 function appendTodoList(
   state: StreamItem[],
   provider: AgentProvider,
@@ -1442,10 +1522,17 @@ function reduceTimelineEvent(
       );
     case "reasoning":
       return appendThought(state, item.text, timestamp, timelineCursor);
-    case "tool_call":
+    case "tool_call": {
+      const informational = readClaudeInformationalToolCall(event);
+      if (informational) {
+        return finalizeActiveThoughts(
+          appendSystemMessage(state, informational, timestamp, timelineCursor),
+        );
+      }
       return finalizeActiveThoughts(
         reduceTimelineToolCall(state, event, item, timestamp, timelineCursor),
       );
+    }
     case "todo": {
       const items: TodoEntry[] = (item.items ?? []).map((todo) => ({
         text: todo.text,
@@ -1621,7 +1708,7 @@ function getEventItemKind(event: AgentStreamEventPayload): StreamItem["kind"] | 
     case "reasoning":
       return "thought";
     case "tool_call":
-      return "tool_call";
+      return readClaudeInformationalToolCall(event) ? "system_message" : "tool_call";
     case "todo":
       return "todo_list";
     case "error":

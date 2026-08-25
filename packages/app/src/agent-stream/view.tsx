@@ -30,6 +30,7 @@ import { usePanelStore } from "@/stores/panel-store";
 import {
   AssistantMessage,
   SpeakMessage,
+  SystemMessage,
   UserMessage,
   ActivityLog,
   ToolCall,
@@ -781,6 +782,9 @@ const AgentStreamViewComponent = forwardRef<AgentStreamViewHandle, AgentStreamVi
 
           case "assistant_message":
             return renderAssistantMessageItem(layoutItem, item);
+
+          case "system_message":
+            return <SystemMessage message={item.text} level={item.level} />;
 
           case "thought":
             return renderThoughtItem(layoutItem, item);

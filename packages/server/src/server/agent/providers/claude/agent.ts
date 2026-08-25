@@ -30,6 +30,7 @@ import {
   mapTaskNotificationUserContentToToolCall,
   readTaskNotificationToolUseIdFromHistoryRecord,
 } from "./task-notification-tool-call.js";
+import { mapClaudeInformationalToToolCall } from "./informational-tool-call.js";
 import {
   findClaudeModel,
   getClaudeModelsWithSettings,
@@ -4109,6 +4110,17 @@ class ClaudeAgentSession implements AgentSession {
       events.push(this.contextUsage.buildCompactionUsageEvent(compactMetadata?.postTokens));
       return;
     }
+    if (message.subtype === "informational") {
+      const informationalItem = mapClaudeInformationalToToolCall(message);
+      if (informationalItem) {
+        events.push({
+          type: "timeline",
+          item: informationalItem,
+          provider: "claude",
+        });
+      }
+      return;
+    }
     if (message.subtype === "task_notification") {
       this.appendTaskNotificationEvents(message, events);
       return;
@@ -5731,6 +5743,11 @@ function convertClaudeHistoryEntryPreamble(
         },
       ],
     };
+  }
+
+  const informationalItem = mapClaudeInformationalToToolCall(entry);
+  if (informationalItem) {
+    return { shortCircuit: [informationalItem] };
   }
 
   const taskNotificationItem = mapTaskNotificationSystemRecordToToolCall(entry);

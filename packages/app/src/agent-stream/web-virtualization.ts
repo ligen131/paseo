@@ -4,6 +4,7 @@ import { estimateAssistantMessageHeightFromCache } from "@/utils/assistant-messa
 export const DEFAULT_WEB_PARTIAL_VIRTUALIZATION_THRESHOLD = 100;
 export const DEFAULT_WEB_MOUNTED_RECENT_STREAM_ITEMS = 50;
 const COLLAPSED_TOOL_SEQUENCE_ROW_HEIGHT_ESTIMATE = 40;
+const SYSTEM_MESSAGE_HEIGHT_ESTIMATE = 144;
 
 type BottomAnchorE2ETestGlobals = typeof globalThis & {
   __PASEO_E2E_WEB_PARTIAL_VIRTUALIZATION_THRESHOLD?: unknown;
@@ -48,6 +49,8 @@ export function estimateStreamItemHeight(item: StreamItem): number {
       return item.images && item.images.length > 0 ? 220 : 96;
     case "assistant_message":
       return estimateAssistantMessageHeightFromCache(item.text) ?? 220;
+    case "system_message":
+      return SYSTEM_MESSAGE_HEIGHT_ESTIMATE;
     case "tool_call":
       return COLLAPSED_TOOL_SEQUENCE_ROW_HEIGHT_ESTIMATE;
     case "thought":

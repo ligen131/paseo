@@ -263,6 +263,36 @@ function canonicalToolTimeline(params: {
   };
 }
 
+function claudeInformationalTimeline(params: {
+  callId: string;
+  text: string;
+  level: "info" | "notice" | "suggestion" | "warning";
+  turnId?: string;
+}): AgentStreamEventPayload {
+  return {
+    type: "timeline",
+    provider: "claude",
+    ...(params.turnId ? { turnId: params.turnId } : {}),
+    item: {
+      type: "tool_call",
+      callId: params.callId,
+      name: "claude_informational",
+      status: "completed",
+      error: null,
+      detail: {
+        type: "plain_text",
+        label: "Claude notice",
+        text: params.text,
+      },
+      metadata: {
+        synthetic: true,
+        source: "claude_informational",
+        level: params.level,
+      },
+    },
+  };
+}
+
 function todoTimeline(
   items: Array<{
     id?: string;
@@ -304,6 +334,121 @@ function findToolByCallId(state: StreamItem[], callId: string): AgentToolCallIte
       isAgentToolCallItem(item) && item.payload.data.callId === callId,
   );
 }
+
+describe("Claude informational timeline projection", () => {
+  it("projects a synthetic informational tool call into a system message", () => {
+    const timestamp = new Date("2026-08-18T10:00:00.000Z");
+    const state = reduceStreamUpdate(
+      [],
+      claudeInformationalTimeline({
+        callId: "claude_informational_notice-1",
+        text: "Archived output: https://example.com/session",
+        level: "notice",
+        turnId: "turn-1",
+      }),
+      timestamp,
+      { timelineCursor: { epoch: "epoch-1", seq: 42 } },
+    );
+
+    expect(state).toEqual([
+      {
+        kind: "system_message",
+        id: "agent_system_claude_informational_notice-1",
+        turnId: "turn-1",
+        timelineCursor: { epoch: "epoch-1", seq: 42 },
+        timestamp,
+        text: "Archived output: https://example.com/session",
+        level: "notice",
+      },
+    ]);
+  });
+
+  it("keeps ordinary plain-text tool calls on the tool-call path", () => {
+    const state = reduceStreamUpdate(
+      [],
+      canonicalToolTimeline({
+        provider: "claude",
+        callId: "task-notification-1",
+        name: "task_notification",
+        status: "completed",
+        detail: {
+          type: "plain_text",
+          label: "Background task complete",
+          text: "done",
+          icon: "wrench",
+        },
+        metadata: {
+          synthetic: true,
+          source: "claude_task_notification",
+          level: "notice",
+        },
+      }),
+      new Date("2026-08-18T10:01:00.000Z"),
+    );
+
+    expect(state).toHaveLength(1);
+    expect(state[0]?.kind).toBe("tool_call");
+  });
+
+  it("flushes the assistant head before appending the system message", () => {
+    const assistant = applyStreamEvent({
+      tail: [],
+      head: [],
+      event: assistantTimeline("Done."),
+      timestamp: new Date("2026-08-18T10:02:00.000Z"),
+    });
+
+    const informational = applyStreamEvent({
+      tail: assistant.tail,
+      head: assistant.head,
+      event: claudeInformationalTimeline({
+        callId: "claude_informational_after-assistant",
+        text: "Current turn: https://example.com/turn",
+        level: "info",
+      }),
+      timestamp: new Date("2026-08-18T10:02:01.000Z"),
+    });
+
+    expect(informational.head).toEqual([]);
+    expect(informational.tail.map((item) => item.kind)).toEqual([
+      "assistant_message",
+      "system_message",
+    ]);
+    expect(informational.tail[0]).toEqual(
+      expect.objectContaining({ kind: "assistant_message", text: "Done." }),
+    );
+    expect(informational.tail[1]).toEqual(
+      expect.objectContaining({
+        kind: "system_message",
+        text: "Current turn: https://example.com/turn",
+      }),
+    );
+  });
+
+  it("updates an existing system message instead of duplicating it during replay", () => {
+    const event = claudeInformationalTimeline({
+      callId: "claude_informational_replayed",
+      text: "Archive complete",
+      level: "suggestion",
+    });
+    const live = reduceStreamUpdate([], event, new Date("2026-08-18T10:03:00.000Z"), {
+      timelineCursor: { epoch: "epoch-1", seq: 7 },
+    });
+    const replayed = reduceStreamUpdate(live, event, new Date("2026-08-18T10:03:01.000Z"), {
+      source: "canonical",
+      timelineCursor: { epoch: "epoch-1", seq: 8 },
+    });
+
+    expect(replayed).toHaveLength(1);
+    expect(replayed[0]).toEqual(
+      expect.objectContaining({
+        kind: "system_message",
+        id: "agent_system_claude_informational_replayed",
+        timelineCursor: { epoch: "epoch-1", seq: 8 },
+      }),
+    );
+  });
+});
 
 describe("stream reducer tool call idempotency", () => {
   it("returns the same detail reference when tool call detail is identical", () => {

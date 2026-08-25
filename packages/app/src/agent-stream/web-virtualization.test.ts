@@ -37,6 +37,16 @@ function assistantMessage(id: string, seed: number): StreamItem {
   };
 }
 
+function systemMessage(id: string, seed: number): StreamItem {
+  return {
+    kind: "system_message",
+    id,
+    text: "Archived output: https://example.com/session",
+    level: "notice",
+    timestamp: createTimestamp(seed),
+  };
+}
+
 function toolCall(id: string, seed: number): StreamItem {
   return {
     kind: "tool_call",
@@ -124,6 +134,10 @@ describe("estimateStreamItemHeight", () => {
   it("uses compact estimates for collapsed tool sequence rows", () => {
     expect(estimateStreamItemHeight(toolCall("tool", 1))).toBe(40);
     expect(estimateStreamItemHeight(thought("thought", 2))).toBe(40);
+  });
+
+  it("uses a dedicated estimate for system messages", () => {
+    expect(estimateStreamItemHeight(systemMessage("system", 1))).toBe(144);
   });
 
   it("uses a larger estimate for user messages with image attachments", () => {
