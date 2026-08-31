@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   applyDictationTranscript,
   computeCanStartDictation,
+  resolveActiveSendBehavior,
   resolveComposerSurfacePresentation,
   resolveImmediateSendActiveTurnBehavior,
   runAlternateSendAction,
@@ -195,6 +196,12 @@ describe("composer send behavior", () => {
     ["queue", "steer"],
   ] as const)("uses %s immediate sends as %s", (sendBehavior, expected) => {
     expect(resolveImmediateSendActiveTurnBehavior(sendBehavior)).toBe(expected);
+  });
+
+  it("sends immediately when queue mode cannot advance past a permission", () => {
+    expect(resolveActiveSendBehavior("queue", true)).toBe("interrupt");
+    expect(resolveActiveSendBehavior("queue", false)).toBe("queue");
+    expect(resolveActiveSendBehavior("steer", true)).toBe("steer");
   });
 
   function actions() {

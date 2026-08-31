@@ -155,6 +155,11 @@ describe("translation resources", () => {
     expect(es.settings.project.scripts.title).toBe("Scripts");
   });
 
+  it("uses the Russian term for continuing a session in copied commands", () => {
+    expect(ru.workspace.tabs.menu.copyResumeCommand).toBe("Копировать команду продолжения");
+    expect(ru.workspace.tabs.toasts.resumeCommandCopiedLabel).toBe("команда продолжения");
+  });
+
   it("keeps model count labels spaced around the count", () => {
     expect(ar.modelSelector.modelCountPlural).toBe("{{count}} نماذج");
     expect(es.modelSelector.modelCountPlural).toBe("{{count}} modelos");
@@ -258,7 +263,6 @@ describe("translation resources", () => {
     expect(en.settings.appearance.fonts.interfaceFont).toBe("Interface font");
     expect(en.settings.shortcuts.actions.rebind).toBe("Rebind");
     expect(en.settings.integrations.commandLine.title).toBe("Command line");
-    expect(en.settings.integrations.skills.updateAvailable).toBe("Update available");
     expect(en.settings.notifications.playSound).toBe("Play sound");
     expect(en.settings.notifications.permission).toBe("Notification permission");
     expect(en.settings.notifications.sentTitle).toBe("Test notification sent");
@@ -311,6 +315,16 @@ describe("translation resources", () => {
     expect(en.workspace.git.pr.empty.pipelineJobsLoadFailed).toBe("Could not load pipeline jobs");
     expect(en.workspace.git.pr.empty.allowedToFail).toBe("allowed to fail");
     expect(en.workspace.git.pr.approvals).toBe("{{given}} of {{required}} approvals");
+    expect(en.workspace.git.pr.accessibility.checkStatus).toEqual({
+      passed: "Passed",
+      failed: "Failed",
+      warning: "Warning",
+      actionRequired: "Action required",
+      manual: "Manual",
+      pending: "Pending",
+      skipped: "Skipped",
+      cancelled: "Cancelled",
+    });
     expect(en.review.comment.placeholder).toBe("Leave a comment");
   });
 
@@ -402,18 +416,16 @@ describe("translation resources", () => {
     expect(en.message.question.otherPlaceholder).toBe("Other...");
     expect(en.message.todo.title).toBe("Tasks");
     expect(en.message.todo.empty).toBe("No tasks yet.");
-    expect(en.message.todo.tasksProgressCurrent).toBe("{{completed}}/{{total}} tasks · {{task}}");
+    expect(en.message.todo.tasksProgress).toBe("{{completed}}/{{total}} tasks");
     expect(en.message.todo.activity).toEqual({
       created: "Created {{count}} tasks",
       added: "Added",
       started: "Started",
       completed: "Completed",
-      reopened: "Reopened",
     });
   });
 
   it("includes workspace tab toast keys for the Batch 4J migration", () => {
-    expect(en.workspace.tabs.emptyPane).toBe("No tabs in this pane.");
     expect(en.workspace.tabs.toasts.copyFailed).toBe("Copy failed");
     expect(en.workspace.tabs.toasts.agentIdCopiedLabel).toBe("Agent ID");
     expect(en.workspace.tabs.toasts.resumeCommandCopiedLabel).toBe("resume command");
@@ -440,6 +452,14 @@ describe("translation resources", () => {
     expect(en.sidebar.workspace.actions.createWorkspaceFor).toBe(
       "Create a new workspace for {{projectName}}",
     );
+    expect(en.sidebar.workspace.checks).toEqual({
+      passed: "Passed: {{count}}",
+      failed: "Failed: {{count}}",
+      warning: "Warnings: {{count}}",
+      actionRequired: "Action required: {{count}}",
+      manual: "Manual: {{count}}",
+      pending: "Pending: {{count}}",
+    });
     expect(en.sidebar.project.empty.title).toBe("No projects yet");
     expect(en.sidebar.project.empty.description).toBe("Add a project to get started");
     expect(en.settings.projectList.hostLoadFailed).toBe(
@@ -495,8 +515,11 @@ describe("translation resources", () => {
     expect(en.agentList.dateSections.recent).toBe("Recent");
     expect(en.message.attachments.imagePreviewUnavailable).toBe("Image preview unavailable.");
     expect(en.message.attachments.imagePreviewLoadFailed).toBe("Unable to load image preview.");
-    expect(en.workspace.tabs.explorer.changes).toBe("Changes");
-    expect(en.workspace.tabs.explorer.files).toBe("Files");
+    expect(en.workspace.tabs.explorerSidebar.changes).toBe("Changes");
+    expect(en.workspace.tabs.explorerSidebar.files).toBe("Files");
+    expect(en.workspace.tabs.actions.maximizePane).toBe("Maximize pane");
+    expect(en.workspace.tabs.actions.restorePane).toBe("Restore pane");
+    expect(en.branchSwitcher.triggerTooltip).toBe("Switch workspace branch");
     expect(en.branchSwitcher.uncommittedTitle).toBe("Uncommitted changes");
     expect(en.branchSwitcher.uncommittedMessage).toBe(
       "You have uncommitted changes. Stash them before switching branches?",
@@ -669,9 +692,6 @@ describe("translation resources", () => {
     );
     expect(en.desktop.daemon.loadFailed).toBe("Unable to load desktop daemon status.");
     expect(en.desktop.integrations.cli.installFailed).toBe("Unable to install the Paseo CLI.");
-    expect(en.desktop.integrations.skills.installFailed).toBe(
-      "Unable to install orchestration skills.",
-    );
   });
 
   it("includes remaining utility chrome keys for the Batch 4T migration", () => {

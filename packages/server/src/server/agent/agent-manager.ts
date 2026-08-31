@@ -35,6 +35,7 @@ import {
   type AgentPromptInput,
   type AgentProvider,
   type AgentRunOptions,
+  type AgentSteerOptions,
   type AgentRunResult,
   type AgentSession,
   type AgentSessionConfig,
@@ -60,14 +61,16 @@ import type {
   AgentTimelineRow,
   AgentTimelineStore,
 } from "./agent-timeline-store-types.js";
-import { DurableTimelineBuffer, type DurableTimelineTimers } from "./durable-timeline-buffer.js";
-import { reconcileProviderHistory } from "./history-reconciliation.js";
 import {
   AGENT_STREAM_COALESCE_DEFAULT_WINDOW_MS,
   AgentStreamCoalescer,
 } from "./agent-stream-coalescer.js";
 import { limitAgentTimelineItemContent } from "./agent-timeline-content.js";
-import { AgentRunState, type ForegroundTurnWaiter } from "./agent-run-state.js";
+import {
+  AgentRunState,
+  type ForegroundTurnWaiter,
+  type PendingForegroundRun,
+} from "./agent-run-state.js";
 import { invokeRewindCapability, type RewindMode } from "./rewind/rewind.js";
 import { isSystemInjectedEnvelope } from "./agent-prompt.js";
 import { stripInternalPaseoMcpServer, withRuntimePaseoMcpServer } from "./runtime-mcp-config.js";
@@ -151,54 +154,6 @@ function yieldToEventLoop(): Promise<void> {
   return new Promise((resolvePromise) => setImmediate(resolvePromise));
 }
 
-/** Preserves timeline writes that land while provider reconciliation yields to the event loop. */
-function preserveConcurrentTimelineChanges(
-  reconciledRows: AgentTimelineRow[],
-  baselineRows: readonly AgentTimelineRow[],
-  currentRows: readonly AgentTimelineRow[],
-): AgentTimelineRow[] {
-  const baselineProviderMessageIds = new Map<string, string | undefined>();
-  for (const row of baselineRows) {
-    if (row.item.type === "user_message" && row.item.clientMessageId) {
-      baselineProviderMessageIds.set(row.item.clientMessageId, row.providerMessageId);
-    }
-  }
-
-  const providerMessageIdUpdates = new Map<string, string>();
-  for (const row of currentRows) {
-    if (
-      row.item.type === "user_message" &&
-      row.item.clientMessageId &&
-      row.providerMessageId &&
-      baselineProviderMessageIds.get(row.item.clientMessageId) !== row.providerMessageId
-    ) {
-      providerMessageIdUpdates.set(row.item.clientMessageId, row.providerMessageId);
-    }
-  }
-
-  const baselineMaxSeq = baselineRows[baselineRows.length - 1]?.seq ?? 0;
-  const appendedRows = currentRows.filter((row) => row.seq > baselineMaxSeq);
-  if (providerMessageIdUpdates.size === 0 && appendedRows.length === 0) {
-    return reconciledRows;
-  }
-
-  for (let index = 0; index < reconciledRows.length; index += 1) {
-    const row = reconciledRows[index]!;
-    if (row.item.type !== "user_message" || !row.item.clientMessageId) continue;
-    const providerMessageId = providerMessageIdUpdates.get(row.item.clientMessageId);
-    if (providerMessageId) {
-      reconciledRows[index] = { ...row, providerMessageId };
-    }
-  }
-  for (const row of appendedRows) {
-    reconciledRows.push({ ...row });
-  }
-  for (let index = 0; index < reconciledRows.length; index += 1) {
-    reconciledRows[index]!.seq = index + 1;
-  }
-  return reconciledRows;
-}
-
 function buildStoredAgentConfig(record: StoredAgentRecord): AgentSessionConfig {
   const config: AgentSessionConfig = {
     provider: record.provider,
@@ -239,6 +194,7 @@ export type {
 export type AgentManagerEvent =
   | { type: "agent_state"; agent: ManagedAgent }
   | { type: "provider_subagent"; event: ProviderSubagentStoreEvent }
+  | { type: "timeline_replacement"; agentId: string; epoch: string }
   | {
       type: "agent_stream";
       agentId: string;
@@ -258,6 +214,7 @@ export interface SubscribeOptions {
 interface HydrateTimelineOptions {
   force?: boolean;
   broadcast?: boolean | (() => boolean);
+  broadcastTimeline?: boolean;
 }
 
 export type ImportablePersistedAgentQueryOptions = ListImportableSessionsOptions & {
@@ -333,8 +290,6 @@ export interface AgentManagerOptions {
   paseoToolCatalogFactory?: PaseoToolCatalogFactory;
   appendSystemPrompt?: string;
   agentStreamCoalesceWindowMs?: number;
-  durableTimelineCoalesceWindowMs?: number;
-  durableTimelineTimers?: DurableTimelineTimers;
   rescueTimeouts?: AgentManagerRescueTimeouts;
   beforeSteerUnavailableFallback?: (input: {
     agentId: string;
@@ -346,6 +301,12 @@ export interface AgentManagerOptions {
 export type ActiveTurnSteerDispatchResult =
   | { status: "inactive" | "steered" }
   | { status: "replaced"; iterator: AsyncGenerator<AgentStreamEvent> };
+
+function stripSteerOptions(options?: AgentSteerOptions): AgentRunOptions | undefined {
+  if (!options) return undefined;
+  const { clearPendingPermissions: _, ...runOptions } = options;
+  return runOptions;
+}
 
 export interface WaitForAgentOptions {
   signal?: AbortSignal;
@@ -520,7 +481,7 @@ function attachManagedTurnIdentity(
     }
     case "timeline": {
       // Live provider items belong to the foreground turn that owns their dispatch.
-      // History deliberately keeps absent IDs so old persisted rows retain legacy grouping.
+      // Provider history deliberately keeps absent IDs because it has no daemon turn identity.
       const turnId = agent.activeForegroundTurnId ?? agent.activeTurnId ?? undefined;
       return turnId ? { event: { ...event, turnId }, turnId } : { event, turnId };
     }
@@ -728,7 +689,6 @@ export class AgentManager {
   private readonly idFactory: () => string;
   private readonly registry?: AgentStorage;
   private readonly durableTimelineStore?: AgentTimelineStore;
-  private readonly durableTimelineBuffer?: DurableTimelineBuffer;
   private readonly previousStatuses = new Map<string, AgentLifecycleStatus>();
   private readonly backgroundTasks = new Set<Promise<void>>();
   private readonly agentRegistrationTasks = new Set<Promise<void>>();
@@ -759,7 +719,6 @@ export class AgentManager {
     this.configurePaseoTools(options);
     this.appendSystemPrompt = options.appendSystemPrompt ?? "";
     this.logger = options.logger.child({ module: "agent", component: "agent-manager" });
-    this.durableTimelineBuffer = this.createDurableTimelineBuffer(options);
     this.rescueTimeouts = {
       reloadSessionCloseMs:
         options.rescueTimeouts?.reloadSessionCloseMs ?? RELOAD_SESSION_CLOSE_TIMEOUT_MS,
@@ -779,20 +738,6 @@ export class AgentManager {
       providerDefinitions: options.providerDefinitions ?? {},
       clients: options.clients ?? {},
     });
-  }
-
-  private createDurableTimelineBuffer(
-    options: AgentManagerOptions,
-  ): DurableTimelineBuffer | undefined {
-    if (!this.durableTimelineStore) return undefined;
-    return new DurableTimelineBuffer(
-      this.durableTimelineStore,
-      options.durableTimelineCoalesceWindowMs ?? 25,
-      options.durableTimelineTimers ?? { setTimeout, clearTimeout },
-      (agentId, error) => {
-        this.logger.error({ err: error, agentId }, "Failed to persist queued timeline rows");
-      },
-    );
   }
 
   private configurePaseoTools(options: AgentManagerOptions): void {
@@ -1447,10 +1392,8 @@ export class AgentManager {
       }
 
       if (rehydrateFromDisk) {
-        // Wipe both durable and in-memory timeline so registerSession mints a
-        // new epoch and hydrateTimelineFromProvider re-streams the freshly read
-        // provider history into an empty timeline.
-        await this.deleteCommittedTimeline(agentId);
+        // Wipe the in-memory timeline so registerSession mints a new epoch and
+        // hydrateTimelineFromProvider re-streams the freshly read provider history.
         this.timelineStore.delete(agentId);
         for (const event of this.providerSubagents.deleteParent(agentId)) {
           this.dispatch({ type: "provider_subagent", event });
@@ -1691,7 +1634,7 @@ export class AgentManager {
 
     await registry.upsert(archivedRecord);
 
-    await this.archiveNativeSessionBestEffort(record.provider, record.persistence);
+    await this.syncNativeArchiveState(record.provider, record.persistence, "archive");
 
     if (this.agents.has(record.id)) {
       this.notifyAgentState(record.id);
@@ -1978,7 +1921,7 @@ export class AgentManager {
     const nextRecord = buildArchivedAgentRecord(record, { archivedAt });
     await registry.upsert(nextRecord);
 
-    await this.archiveNativeSessionBestEffort(record.provider, record.persistence);
+    await this.syncNativeArchiveState(record.provider, record.persistence, "archive");
 
     if (this.agents.has(agentId)) {
       this.notifyAgentState(agentId);
@@ -2005,7 +1948,7 @@ export class AgentManager {
       return false;
     }
 
-    await this.unarchiveNativeSession(record.provider, record.persistence);
+    await this.syncNativeArchiveState(record.provider, record.persistence, "restore");
 
     await registry.upsert({
       ...record,
@@ -2204,6 +2147,37 @@ export class AgentManager {
     });
   }
 
+  private async startPendingForegroundTurn(params: {
+    agent: ActiveManagedAgent;
+    agentId: string;
+    pendingRun: PendingForegroundRun;
+    prompt: AgentPromptInput;
+    options?: AgentRunOptions;
+  }): Promise<string> {
+    const { agent, agentId, pendingRun, prompt, options } = params;
+    try {
+      const result = await agent.session.startTurn(prompt, options);
+      if (pendingRun.settled) {
+        throw new Error(`Agent ${agentId} run was canceled before its turn started`);
+      }
+      return result.turnId;
+    } catch (error) {
+      if (pendingRun.settled) {
+        throw error;
+      }
+      agent.pendingReplacement = false;
+      const errorMsg = error instanceof Error ? error.message : "Failed to start turn";
+      await this.handleStreamEvent(agent, {
+        type: "turn_failed",
+        provider: agent.provider,
+        error: errorMsg,
+      });
+      this.finalizeForegroundTurn(agent);
+      this.runs.settleForegroundRun(agentId, pendingRun.token);
+      throw error;
+    }
+  }
+
   streamAgent(
     agentId: string,
     prompt: AgentPromptInput,
@@ -2248,21 +2222,13 @@ export class AgentManager {
     const streamForwarder = async function* streamForwarder(this: AgentManager) {
       let turnId: string;
       let turnStream: ReturnType<AgentRunState["createTurnStream"]> | null = null;
-      try {
-        const result = await agent.session.startTurn(prompt, options);
-        turnId = result.turnId;
-      } catch (error) {
-        agent.pendingReplacement = false;
-        const errorMsg = error instanceof Error ? error.message : "Failed to start turn";
-        await this.handleStreamEvent(agent, {
-          type: "turn_failed",
-          provider: agent.provider,
-          error: errorMsg,
-        });
-        this.finalizeForegroundTurn(agent);
-        this.runs.settleForegroundRun(agentId, pendingRun.token);
-        throw error;
-      }
+      turnId = await this.startPendingForegroundTurn({
+        agent,
+        agentId,
+        pendingRun,
+        prompt,
+        options,
+      });
 
       if (isReplacement) {
         agent.pendingReplacement = false;
@@ -2464,11 +2430,11 @@ export class AgentManager {
   async steerAgentRun(
     agentId: string,
     prompt: AgentPromptInput,
-    options?: AgentRunOptions,
+    options?: AgentSteerOptions,
   ): Promise<SteerResult> {
     const agent = this.requireSessionAgent(agentId);
-    const expectedTurnId = agent.activeForegroundTurnId;
-    if (!expectedTurnId || !this.runs.hasRun(agentId) || !agent.session.steerActiveTurn) {
+    const expectedTurnId = agent.activeForegroundTurnId ?? agent.activeTurnId;
+    if (!expectedTurnId || !agent.session.steerActiveTurn) {
       return { status: "unavailable" };
     }
     const result = await this.runSteerAdmission(agent, expectedTurnId, async () => {
@@ -2482,8 +2448,8 @@ export class AgentManager {
       return admission;
     });
     // An unavailable answer is only safe to fall back from while this admission
-    // still owns the foreground. Never let an A admission replace a later B.
-    if (result.status === "unavailable" && agent.activeForegroundTurnId !== expectedTurnId) {
+    // still owns the active turn. Never let an A admission replace a later B.
+    if (result.status === "unavailable" && agent.activeTurnId !== expectedTurnId) {
       throw new Error("Active turn changed before steering could be delivered");
     }
     return result;
@@ -2492,11 +2458,11 @@ export class AgentManager {
   async steerOrReplaceActiveTurn(
     agentId: string,
     prompt: AgentPromptInput,
-    options?: AgentRunOptions,
+    options?: AgentSteerOptions,
   ): Promise<ActiveTurnSteerDispatchResult> {
     const agent = this.requireSessionAgent(agentId);
-    const expectedTurnId = agent.activeForegroundTurnId;
-    if (!expectedTurnId || !this.runs.hasRun(agentId)) {
+    const expectedTurnId = agent.activeForegroundTurnId ?? agent.activeTurnId;
+    if (!expectedTurnId) {
       return { status: "inactive" };
     }
 
@@ -2516,12 +2482,29 @@ export class AgentManager {
       return { status: "steered" };
     }
 
+    // Providers without autonomous steering keep their existing dispatch behavior. The shared
+    // admission may recognize the turn, but only an accepted steer can own it without replacement.
+    if (agent.activeForegroundTurnId === null && agent.activeTurnId === expectedTurnId) {
+      return { status: "inactive" };
+    }
+
     await this.beforeSteerUnavailableFallback?.({ agentId, expectedTurnId });
-    this.assertSteerAdmissionOwnsForeground(agent, expectedTurnId);
+    this.assertSteerAdmissionOwnsTurn(agent, expectedTurnId);
     return {
       status: "replaced",
-      iterator: await this.replaceAdmittedForegroundTurn(agent, expectedTurnId, prompt, options),
+      iterator: await this.replaceAdmittedForegroundTurn(
+        agent,
+        expectedTurnId,
+        prompt,
+        stripSteerOptions(options),
+      ),
     };
+  }
+
+  private assertSteerAdmissionOwnsTurn(agent: ActiveManagedAgent, expectedTurnId: string): void {
+    if (agent.activeTurnId !== expectedTurnId) {
+      throw new Error("Active turn changed before steering could be delivered");
+    }
   }
 
   private assertSteerAdmissionOwnsForeground(
@@ -2541,7 +2524,7 @@ export class AgentManager {
     return this.runForegroundMutation(agent.id, async () => {
       await this.drainSessionEvents(agent.id);
       this.agentStreamCoalescer.flushFor(agent.id);
-      this.assertSteerAdmissionOwnsForeground(agent, expectedTurnId);
+      this.assertSteerAdmissionOwnsTurn(agent, expectedTurnId);
       const barrier: SteerEventBarrier = { events: [] };
       this.steerEventBarriers.set(agent.id, barrier);
       try {
@@ -2602,15 +2585,6 @@ export class AgentManager {
       messageId: clientMessageId,
       turnId: expectedTurnId,
     });
-    if (this.durableTimelineBuffer) {
-      try {
-        await this.durableTimelineBuffer.flush(agent.id);
-      } catch (error) {
-        throw new Error("Steering was accepted but its canonical message could not be persisted", {
-          cause: error,
-        });
-      }
-    }
     this.emitState(agent);
   }
 
@@ -2792,6 +2766,17 @@ export class AgentManager {
         turnId: run.turnId,
       });
       await run.settledPromise;
+    } else if (settlement === "timed_out" && run.kind === "foreground") {
+      this.logger.warn(
+        { agentId, kind: run.kind },
+        "cancelAgentRun: acknowledged pending turn still active after timeout, clearing it",
+      );
+      this.runs.settleForegroundRun(agentId, run.token);
+      if (!agent.pendingReplacement) {
+        agent.lifecycle = "idle";
+        this.touchUpdatedAt(agent);
+        this.emitState(agent);
+      }
     } else if (settlement === "timed_out" && run.kind === "autonomous") {
       this.logger.warn(
         { agentId, kind: run.kind },
@@ -2860,9 +2845,7 @@ export class AgentManager {
   }
 
   /**
-   * Hydrates the timeline from provider history if the agent's durable
-   * timeline is empty (e.g., imported agents that have provider history
-   * on disk but no persisted timeline rows). No-ops if already hydrated.
+   * Hydrates the runtime timeline from provider history. No-ops if already hydrated.
    */
   async hydrateTimelineFromProvider(
     agentId: string,
@@ -2899,7 +2882,16 @@ export class AgentManager {
       );
       await invokeRewindCapability(agent.session, { messageId: providerMessageId, mode });
       if (mode !== "files") {
-        await this.hydrateTimelineFromProvider(agentId, { force: true, broadcast: true });
+        await this.hydrateTimelineFromProvider(agentId, {
+          force: true,
+          broadcast: true,
+          broadcastTimeline: false,
+        });
+        this.dispatch({
+          type: "timeline_replacement",
+          agentId,
+          epoch: this.timelineStore.getEpoch(agentId),
+        });
       }
       await this.refreshRuntimeInfo(agent);
       await this.persistSnapshot(agent);
@@ -2918,17 +2910,13 @@ export class AgentManager {
     }
   }
 
-  async deleteCommittedTimeline(agentId: string): Promise<void> {
-    if (!this.durableTimelineStore) {
-      return;
-    }
-    await this.durableTimelineBuffer?.discard(agentId);
-    await this.durableTimelineStore.deleteAgent(agentId);
-  }
-
   async deleteAgentState(agentId: string): Promise<void> {
     this.discardRetainedAgentState(agentId);
     await this.deleteCommittedTimeline(agentId);
+  }
+
+  async deleteCommittedTimeline(agentId: string): Promise<void> {
+    await this.durableTimelineStore?.deleteAgent(agentId);
   }
 
   async getLastAssistantMessage(agentId: string): Promise<string | null> {
@@ -2980,33 +2968,23 @@ export class AgentManager {
     if (!this.durableTimelineStore) {
       return liveSegment?.text ?? null;
     }
-
     if (!liveSegment) {
       return await this.durableTimelineStore.getLastAssistantMessage(agentId);
     }
-
     if (!liveSegment.startsAtBeginning) {
       return liveSegment.text;
     }
-
     const lastDurableItem = await this.durableTimelineStore.getLastItem(agentId);
     if (lastDurableItem?.type !== "assistant_message") {
       return liveSegment.text;
     }
-
     const durableMessage = await this.durableTimelineStore.getLastAssistantMessage(agentId);
     return durableMessage ? `${durableMessage}${liveSegment.text}` : liveSegment.text;
   }
 
   private async getLastItemFromStores(agentId: string): Promise<AgentTimelineItem | null> {
     const lastLiveItem = this.timelineStore.getLastItem(agentId);
-    if (lastLiveItem) {
-      return lastLiveItem;
-    }
-    if (!this.durableTimelineStore) {
-      return null;
-    }
-    return await this.durableTimelineStore.getLastItem(agentId);
+    return lastLiveItem ?? (await this.durableTimelineStore?.getLastItem(agentId)) ?? null;
   }
 
   async waitForAgentEvent(
@@ -3207,7 +3185,7 @@ export class AgentManager {
       );
 
       const now = new Date();
-      const { durableHistoryComplete } = await this.initializeAgentTimelineForRegister({
+      const { durableTimelineHasRows } = await this.initializeAgentTimelineForRegister({
         agentId: resolvedAgentId,
         now,
         options,
@@ -3218,12 +3196,10 @@ export class AgentManager {
         session,
         config,
         now,
+        durableTimelineHasRows,
         options,
       });
 
-      if (managed.historyPrimed && !durableHistoryComplete) {
-        await this.commitCompleteHistorySnapshot(resolvedAgentId);
-      }
       this.assertAcceptingAgentRegistrations();
       this.agents.set(resolvedAgentId, managed);
       registered = true;
@@ -3303,19 +3279,18 @@ export class AgentManager {
           updatedAt?: Date;
         }
       | undefined;
-  }): Promise<{ durableHistoryComplete: boolean }> {
+  }): Promise<{ durableTimelineHasRows: boolean }> {
     const { agentId, now, options } = params;
     const timelineAlreadyPrimed = this.timelineStore.has(agentId);
     const explicitTimelineSeed = buildExplicitTimelineSeedForRegister(now, options);
     const shouldSeedFromDurable =
-      !explicitTimelineSeed &&
-      !this.timelineStore.has(agentId) &&
-      this.durableTimelineStore !== undefined;
+      !explicitTimelineSeed && !this.timelineStore.has(agentId) && this.durableTimelineStore;
     const durableTimelineSeed = shouldSeedFromDurable
       ? await this.loadCommittedTimelineSeed(agentId, now)
       : null;
-    const durableHistoryComplete =
-      timelineAlreadyPrimed || durableTimelineSeed?.historyComplete === true;
+    const durableTimelineHasRows =
+      timelineAlreadyPrimed ||
+      (durableTimelineSeed != null && (durableTimelineSeed.nextSeq ?? 1) > 1);
     const timelineSeed = explicitTimelineSeed ?? durableTimelineSeed;
     if (timelineSeed || !this.timelineStore.has(agentId)) {
       this.timelineStore.initialize(agentId, timelineSeed ?? { timestamp: now.toISOString() });
@@ -3323,7 +3298,7 @@ export class AgentManager {
     if (options?.timelineRows?.length) {
       this.enqueueDurableTimelineBulkInsert(agentId, options.timelineRows);
     }
-    return { durableHistoryComplete };
+    return { durableTimelineHasRows };
   }
 
   private buildManagedAgentForRegister(params: {
@@ -3331,6 +3306,7 @@ export class AgentManager {
     session: AgentSession;
     config: AgentSessionConfig;
     now: Date;
+    durableTimelineHasRows: boolean;
     options:
       | {
           createdAt?: Date;
@@ -3347,7 +3323,7 @@ export class AgentManager {
         }
       | undefined;
   }): ActiveManagedAgent {
-    const { resolvedAgentId, session, config, now, options } = params;
+    const { resolvedAgentId, session, config, now, durableTimelineHasRows, options } = params;
     return {
       id: resolvedAgentId,
       provider: config.provider,
@@ -3377,7 +3353,7 @@ export class AgentManager {
         options?.persistence ?? session.describePersistence(),
         config.cwd,
       ),
-      historyPrimed: options?.historyPrimed ?? false,
+      historyPrimed: options?.historyPrimed ?? durableTimelineHasRows,
       lastUserMessageAt: options?.lastUserMessageAt ?? null,
       lastUsage: options?.lastUsage,
       lastError: options?.lastError,
@@ -3390,20 +3366,13 @@ export class AgentManager {
   private async loadCommittedTimelineSeed(
     agentId: string,
     now: Date,
-  ): Promise<SeedAgentTimelineOptions & { historyComplete?: boolean }> {
+  ): Promise<SeedAgentTimelineOptions> {
     if (!this.durableTimelineStore) {
       return { timestamp: now.toISOString() };
     }
-
-    const snapshot = await this.durableTimelineStore.getCommittedSnapshot(agentId, {
-      shareItems: true,
-    });
-    const rows = snapshot.rows;
     return {
-      rows,
-      nextSeq: rows.length > 0 ? rows[rows.length - 1]!.seq + 1 : 1,
+      nextSeq: (await this.durableTimelineStore.getLatestCommittedSeq(agentId)) + 1,
       timestamp: now.toISOString(),
-      historyComplete: snapshot.historyComplete,
     };
   }
 
@@ -3689,11 +3658,13 @@ export class AgentManager {
     }
 
     const broadcast = options?.broadcast ?? false;
+    const broadcastTimeline = options?.broadcastTimeline ?? broadcast;
 
     if (options?.force) {
       await this.forceHydrateTimelineFromLegacyProviderHistory(
         agent,
         typeof broadcast === "function" ? broadcast() : broadcast,
+        typeof broadcastTimeline === "function" ? broadcastTimeline() : broadcastTimeline,
       );
       return;
     }
@@ -3704,6 +3675,7 @@ export class AgentManager {
   private async forceHydrateTimelineFromLegacyProviderHistory(
     agent: ActiveManagedAgent,
     broadcast: boolean,
+    broadcastTimeline: boolean,
   ): Promise<void> {
     const historyEvents: Extract<AgentStreamEvent, { type: "timeline" }>[] = [];
     const providerSubagentEvents: Extract<AgentStreamEvent, { type: "provider_subagent" }>[] = [];
@@ -3724,17 +3696,11 @@ export class AgentManager {
       }
     }
 
-    const reconciledRows = await reconcileProviderHistory(
-      this.timelineStore.getRows(agent.id),
-      historyEvents.map((event) => ({ item: event.item, timestamp: event.timestamp })),
-      { mode: "force" },
-    );
     this.agentStreamCoalescer.flushAndDiscard(agent.id);
-    await this.durableTimelineBuffer?.flush(agent.id);
     await this.deleteCommittedTimeline(agent.id);
     this.timelineStore.delete(agent.id);
-    this.timelineStore.initialize(agent.id, { rows: reconciledRows });
-    agent.historyPrimed = false;
+    this.timelineStore.initialize(agent.id, { timestamp: new Date().toISOString() });
+    agent.historyPrimed = true;
 
     for (const event of this.providerSubagents.deleteParent(agent.id)) {
       if (broadcast) {
@@ -3747,11 +3713,20 @@ export class AgentManager {
         this.dispatch({ type: "provider_subagent", event: update });
       }
     }
-    if (broadcast) {
-      this.dispatchReconciledTimelineRows(agent, reconciledRows);
+    for (const event of historyEvents) {
+      const row = this.recordTimeline(
+        agent.id,
+        event.item,
+        event.timestamp ? { timestamp: event.timestamp } : undefined,
+      );
+      if (broadcastTimeline) {
+        this.dispatchStream(agent.id, event, {
+          seq: row.seq,
+          epoch: this.timelineStore.getEpoch(agent.id),
+          timestamp: row.timestamp,
+        });
+      }
     }
-    await this.commitCompleteHistorySnapshot(agent.id);
-    agent.historyPrimed = true;
     this.touchUpdatedAt(agent);
     this.emitState(agent);
   }
@@ -3761,9 +3736,11 @@ export class AgentManager {
     broadcast: boolean | (() => boolean),
   ): Promise<void> {
     const deferredBroadcast = typeof broadcast === "function";
-    let timelineRows: AgentTimelineRow[] = [];
+    const timelineEvents: Array<{
+      event: Extract<AgentStreamEvent, { type: "timeline" }>;
+      row: AgentTimelineRow;
+    }> = [];
     const providerSubagentEvents: AgentManagerEvent[] = [];
-    const historyEvents: Extract<AgentStreamEvent, { type: "timeline" }>[] = [];
     agent.historyPrimed = false;
     let processedEvents = 0;
     try {
@@ -3789,34 +3766,26 @@ export class AgentManager {
         if (event.item.type === "user_message" && isSystemInjectedEnvelope(event.item.text)) {
           continue;
         }
-        historyEvents.push(event);
+        const row = this.recordTimeline(
+          agent.id,
+          event.item,
+          event.timestamp ? { timestamp: event.timestamp } : undefined,
+        );
+        if (deferredBroadcast) {
+          timelineEvents.push({ event, row });
+        } else if (broadcast) {
+          this.dispatchStream(agent.id, event, {
+            seq: row.seq,
+            epoch: this.timelineStore.getEpoch(agent.id),
+            timestamp: row.timestamp,
+          });
+        }
       }
-
-      const canonicalRows = this.timelineStore.getRows(agent.id);
-      let reconciledRows = await reconcileProviderHistory(
-        canonicalRows,
-        historyEvents.map((event) => ({ item: event.item, timestamp: event.timestamp })),
-      );
-      reconciledRows = preserveConcurrentTimelineChanges(
-        reconciledRows,
-        canonicalRows,
-        this.timelineStore.getRows(agent.id),
-      );
-      this.timelineStore.initialize(agent.id, { rows: reconciledRows });
-      if (deferredBroadcast) {
-        timelineRows = reconciledRows;
-      } else if (broadcast) {
-        this.dispatchReconciledTimelineRows(agent, reconciledRows);
-      }
-      await this.commitCompleteHistorySnapshot(agent.id);
-      agent.historyPrimed = true;
     } catch (error) {
-      this.logger.warn(
-        { err: error, agentId: agent.id },
-        "Failed to commit provider history snapshot",
-      );
+      this.logger.warn({ err: error, agentId: agent.id }, "Failed to hydrate provider history");
       throw error;
     }
+    agent.historyPrimed = true;
 
     if (typeof broadcast !== "function" || !broadcast()) {
       return;
@@ -3824,40 +3793,13 @@ export class AgentManager {
     for (const event of providerSubagentEvents) {
       this.dispatch(event);
     }
-    this.dispatchReconciledTimelineRows(agent, timelineRows);
-  }
-
-  private dispatchReconciledTimelineRows(
-    agent: ActiveManagedAgent,
-    rows: readonly AgentTimelineRow[],
-  ): void {
-    const epoch = this.timelineStore.getEpoch(agent.id);
-    for (const row of rows) {
-      this.dispatchStream(
-        agent.id,
-        {
-          type: "timeline",
-          provider: agent.provider,
-          item: row.item,
-          ...(row.turnId ? { turnId: row.turnId } : {}),
-          timestamp: row.timestamp,
-        },
-        {
-          seq: row.seq,
-          epoch,
-          timestamp: row.timestamp,
-        },
-      );
+    for (const { event, row } of timelineEvents) {
+      this.dispatchStream(agent.id, event, {
+        seq: row.seq,
+        epoch: this.timelineStore.getEpoch(agent.id),
+        timestamp: row.timestamp,
+      });
     }
-  }
-
-  private async commitCompleteHistorySnapshot(agentId: string): Promise<void> {
-    if (!this.durableTimelineStore) return;
-    await this.durableTimelineBuffer?.flush(agentId);
-    await this.durableTimelineStore.replaceCommittedSnapshot(agentId, {
-      rows: this.timelineStore.getRows(agentId),
-      historyComplete: true,
-    });
   }
 
   private notifyForegroundTurnWaiters(agentId: string, event: AgentStreamEvent): void {
@@ -4509,14 +4451,11 @@ export class AgentManager {
       timestamp?: string;
       providerMessageId?: string;
       turnId?: string;
-      persist?: boolean;
     },
   ): AgentTimelineRow {
     item = limitAgentTimelineItemContent(item);
     const row = this.timelineStore.append(agentId, item, options);
-    if (options?.persist !== false) {
-      this.enqueueDurableTimelineAppend(agentId, row);
-    }
+    this.enqueueDurableTimelineAppend(agentId, row);
     return row;
   }
 
@@ -4603,10 +4542,16 @@ export class AgentManager {
   }
 
   private enqueueDurableTimelineAppend(agentId: string, row: AgentTimelineRow): void {
-    if (!this.durableTimelineBuffer) {
+    if (!this.durableTimelineStore) {
       return;
     }
-    this.durableTimelineBuffer.enqueue(agentId, row);
+    const task = this.durableTimelineStore.bulkInsert(agentId, [row]).catch((err) => {
+      this.logger.error(
+        { err, agentId, seq: row.seq, itemType: row.item.type },
+        "Failed to append timeline row to durable store",
+      );
+    });
+    this.trackBackgroundTask(task);
   }
 
   private enqueueDurableTimelineBulkInsert(
@@ -4616,15 +4561,18 @@ export class AgentManager {
     if (!this.durableTimelineStore || rows.length === 0) {
       return;
     }
-    for (const row of rows) this.durableTimelineBuffer?.enqueue(agentId, row);
+    const task = this.durableTimelineStore.bulkInsert(agentId, rows).catch((err) => {
+      this.logger.error(
+        { err, agentId, rowCount: rows.length },
+        "Failed to seed durable timeline store",
+      );
+    });
+    this.trackBackgroundTask(task);
   }
 
   private enqueueDurableTimelineUpdate(agentId: string, row: AgentTimelineRow): void {
     if (!this.durableTimelineStore) return;
-    const task = (async () => {
-      await this.durableTimelineBuffer?.flush(agentId);
-      await this.durableTimelineStore?.updateCommittedRow(agentId, row);
-    })().catch((err) => {
+    const task = this.durableTimelineStore.updateCommittedRow(agentId, row).catch((err) => {
       this.logger.error(
         { err, agentId, seq: row.seq, itemType: row.item.type },
         "Failed to enrich durable timeline row",
@@ -4671,7 +4619,6 @@ export class AgentManager {
 
   private async flushTasks(options: { includeAgentRegistrations: boolean }): Promise<void> {
     this.agentStreamCoalescer.flushAll();
-    await this.durableTimelineBuffer?.flushAll();
     // Drain tasks, including tasks spawned while awaiting.
     while (
       this.backgroundTasks.size > 0 ||
@@ -4979,31 +4926,28 @@ export class AgentManager {
     return client;
   }
 
-  async archiveNativeSessionBestEffort(
+  private async syncNativeArchiveState(
     provider: AgentProvider,
     persistence: AgentPersistenceHandle | null | undefined,
+    state: "archive" | "restore",
   ): Promise<void> {
     if (!persistence) return;
     const client = this.clients.get(provider);
-    if (!client?.archiveNativeSession) return;
+    const sync =
+      state === "archive" ? client?.archiveNativeSession : client?.unarchiveNativeSession;
+    if (!sync) return;
+    if (state === "restore") {
+      await sync.call(client, persistence);
+      return;
+    }
     try {
-      await client.archiveNativeSession(persistence);
+      await sync.call(client, persistence);
     } catch (error) {
       this.logger.warn(
         { error, provider, sessionId: persistence.sessionId },
         "Failed to archive native session (best-effort)",
       );
     }
-  }
-
-  private async unarchiveNativeSession(
-    provider: AgentProvider,
-    persistence: AgentPersistenceHandle | null | undefined,
-  ): Promise<void> {
-    if (!persistence) return;
-    const client = this.clients.get(provider);
-    if (!client?.unarchiveNativeSession) return;
-    await client.unarchiveNativeSession(persistence);
   }
 
   private requireAgent(id: string): LiveManagedAgent {

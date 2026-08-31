@@ -160,6 +160,35 @@ index 1234567..abcdefg 100644
  </config>
 `;
 
+const SVELTE_DIFF = `diff --git a/Counter.svelte b/Counter.svelte
+index 1234567..abcdefg 100644
+--- a/Counter.svelte
++++ b/Counter.svelte
+@@ -1,7 +1,7 @@
+ <script lang="ts">
+-  let count: number = 1;
++  let count: number = 2;
+ </script>
+
+ {#if count > 0}
+   <span class="badge">{count}</span>
+ {/if}
+`;
+
+const ASTRO_DIFF = `diff --git a/Page.astro b/Page.astro
+index 1234567..abcdefg 100644
+--- a/Page.astro
++++ b/Page.astro
+@@ -1,7 +1,7 @@
+ ---
+-const title = "Hello";
++const title = "Hello, Astro";
+ ---
+ <main class="page">
+   <h1>{title}</h1>
+ </main>
+`;
+
 describe("parseDiff", () => {
   it("parses a simple diff with one hunk", () => {
     const files = parseDiff(SIMPLE_DIFF);
@@ -469,6 +498,45 @@ describe("highlightDiffFromHunks", () => {
     );
     expect(addedLine?.tokens).toBeDefined();
     expect(addedLine!.tokens!.some((t) => t.text === "2" && t.style === "number")).toBe(true);
+  });
+
+  it("adds syntax highlighting tokens to Svelte components", () => {
+    const files = parseDiff(SVELTE_DIFF);
+    const highlighted = highlightDiffFromHunks(files[0]);
+    const hunk = highlighted.hunks[0];
+
+    const scriptLine = hunk.lines[1];
+    expect(scriptLine.tokens).toBeDefined();
+    expect(scriptLine.tokens!.some((t) => t.text === "script" && t.style === "tag")).toBe(true);
+
+    const addedLine = hunk.lines.find(
+      (line) => line.type === "add" && line.content.includes("count"),
+    );
+    expect(addedLine?.tokens).toBeDefined();
+    expect(addedLine!.tokens!.some((t) => t.text === "let" && t.style === "keyword")).toBe(true);
+    expect(addedLine!.tokens!.some((t) => t.text === "number" && t.style === "type")).toBe(true);
+    expect(addedLine!.tokens!.some((t) => t.text === "2" && t.style === "number")).toBe(true);
+
+    const blockLine = hunk.lines.find((line) => line.content.includes("{#if"));
+    expect(blockLine?.tokens).toBeDefined();
+    expect(blockLine!.tokens!.some((t) => t.text === "if" && t.style === "keyword")).toBe(true);
+    expect(blockLine!.tokens!.some((t) => t.text === "count" && t.style === "variable")).toBe(true);
+
+    const markupLine = hunk.lines.find((line) => line.content.includes("<span"));
+    expect(markupLine?.tokens).toBeDefined();
+    expect(markupLine!.tokens!.some((t) => t.text === "span" && t.style === "tag")).toBe(true);
+  });
+
+  it("adds syntax highlighting tokens to Astro components", () => {
+    const [file] = parseDiff(ASTRO_DIFF);
+    const highlighted = highlightDiffFromHunks(file);
+    const addedLine = highlighted.hunks[0].lines.find((line) => line.type === "add");
+    const markupLine = highlighted.hunks[0].lines.find((line) => line.content.includes("<main"));
+
+    expect(addedLine?.tokens).toContainEqual({ text: "const", style: "keyword" });
+    expect(addedLine?.tokens).toContainEqual({ text: '"Hello, Astro"', style: "string" });
+    expect(markupLine?.tokens).toContainEqual({ text: "main", style: "tag" });
+    expect(markupLine?.tokens).toContainEqual({ text: "class", style: "attribute" });
   });
 
   it("adds syntax highlighting tokens to Objective-C file extensions", () => {

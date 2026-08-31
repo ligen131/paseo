@@ -28,11 +28,13 @@ Before adding a new component, read `components/ui/`. The primitive usually exis
 
 ## 3. Hierarchy
 
-Hierarchy is conveyed through weight and color, not size. Most interface text is `fontSize.sm`; compact metadata and hints use `fontSize.xs`. The distinction between a row's primary line and its secondary line is `foreground` versus `foregroundMuted`.
+Hierarchy is conveyed through weight and color, not size. Most interface text is `fontSize.base`; compact metadata and hints use `fontSize.sm`. The distinction between a row's primary line and its secondary line is `foreground` versus `foregroundMuted`.
+
+The authored interface ramp uses a 14px base. New native installs default to 15px; web and desktop default to 14px. The Appearance **Interface size** setting is the rendered `fontSize.base` value and scales the rest of the UI ramp proportionally. Primary readable content has its own `fontSize.content`, which defaults to 15px on every platform. It owns message bodies, composer input, Markdown, and PR prose. Controls, navigation, metadata, tool chrome, code, diffs, editors, and terminals stay on their interface or code tokens. **Code size** remains independent.
 
 Weight has three tiers, applied by role:
 
-- **Screen titles** — the title at the top of a screen — use `<ScreenTitle>` (`packages/app/src/components/headers/screen-title.tsx`), which renders `fontSize.base` at weight `400` on compact and `300` on desktop. Top-of-screen titles are lighter on desktop, not heavier. The workspace header overrides the size to `fontSize.sm` so its title, project name, tabs, pane chrome, conversation text, and composer share the desktop working-surface scale (`packages/app/src/screens/workspace/workspace-screen.tsx`).
+- **Screen titles** — the title in app chrome — use `<ScreenTitle>` (`packages/app/src/components/headers/screen-title.tsx`), which renders `fontSize.base` at weight `400` on compact and `300` on desktop. The New workspace hero is the only larger product title; it uses `fontSize["2xl"]` (`packages/app/src/screens/new-workspace-screen.tsx`).
 - **Structural labels** use `fontWeight.medium`. This applies to section labels above a stack of rows (`packages/app/src/components/agent-list.tsx:519-523`, `packages/app/src/components/keyboard-shortcuts-dialog.tsx:63-67`), form field labels above an input inside a modal (`packages/app/src/components/add-host-modal.tsx:19-23`, `packages/app/src/components/pair-link-modal.tsx:24-28`), the title at the top of a modal/sheet/dialog (`packages/app/src/components/adaptive-modal-sheet.tsx:90-94`, `packages/app/src/components/ui/combobox.tsx:1607-1611`, `packages/app/src/components/welcome-screen.tsx:48-53`), action button labels in tight components such as the sidebar callout actions (`packages/app/src/components/sidebar-callout.tsx:218-221`), and inline data emphasis on dense metadata rows (`packages/app/src/components/git-diff-pane.tsx:2322-2327`, `packages/app/src/components/file-explorer-pane.tsx:1115-1122`).
 - **Content** uses `fontWeight.normal`. This applies to settings rows (`packages/app/src/styles/settings.ts`), sidebar primary list-item titles (`packages/app/src/components/sidebar-workspace-list.tsx:2680-2686`, `packages/app/src/components/agent-list.tsx:572-578`), `<Button>` text (`packages/app/src/components/ui/button.tsx:80-84`), `<StatusBadge>` text (`packages/app/src/components/ui/status-badge.tsx:56-60`), and `<SidebarCallout>` titles (`packages/app/src/components/sidebar-callout.tsx:175-180`).
 
@@ -60,11 +62,15 @@ The button is `<Button>` (`packages/app/src/components/ui/button.tsx`). It has f
 
 `ghost` is structural and non-committal — no border, no fill. Back arrows, header toggles, "Load more" footers (`packages/app/src/screens/sessions-screen.tsx:54-63`), more-affordances. Ghost is used when the affordance is part of the chrome, not a decision.
 
+Header and toolbar controls use `interactionHighlight` for hovered, pressed, open, and selected
+backgrounds. It is a translucent semantic fill so the same control works over the main surface and
+the sidebar. Apply it as `backgroundColor`; setting `opacity` on the control also fades its content.
+
 `destructive` is filled with `destructive`. It only appears inside a confirm. The button on the page is `outline`; the destructive button is the confirm button inside the dialog.
 
 Sizes: `xs` for ultra-tight inline triggers. `sm` for any button sitting in a row. `md` is the page default. `lg` is reserved for large standalone CTAs.
 
-Sizes are a shared contract across control kinds, defined once in `control-geometry.ts`: `xs` = 28px tall with `fontSize.xs` labels, `sm` = 32px with `fontSize.sm`, `md`/`lg` = 44px with `fontSize.sm`. `<SegmentedControl>` (`packages/app/src/components/ui/segmented-control.tsx`) takes the same `xs`/`sm`/`md` sizes — a segmented control next to a `<Button>` of the same size always matches in height, label size, and horizontal padding. Thin chrome such as the file toolbar uses `xs`; settings rows use `sm`. Never shrink a control's font or padding locally to fit a context — if the context needs a smaller control, the size tier is missing or the wrong one is in use.
+Sizes are a shared contract across control kinds, defined once in `control-geometry.ts`: `xs` = 28px tall with `fontSize.sm` labels, `sm` = 32px with `fontSize.base`, `md`/`lg` = 44px with `fontSize.base`. `<SegmentedControl>` (`packages/app/src/components/ui/segmented-control.tsx`) takes the same `xs`/`sm`/`md` sizes — a segmented control next to a `<Button>` of the same size always matches in height, label size, and corner radius. Its segments run one padding step tighter than a button, because the gap between segments already reads as padding. The selected segment is a `surface3` fill with `foreground` text, not an inverted one — inverting it inside thin chrome puts a white slab in the toolbar. Thin chrome such as the file toolbar uses `xs`; settings rows use `sm`. Never shrink a control's font or padding locally to fit a context — if the context needs a smaller control, the size tier is missing or the wrong one is in use.
 
 A `<Pressable>` wrapping a `<Text>` is a sixth variant. It is wrong. `<Button>` accepts `style`, `textStyle`, `leftIcon`, `disabled`, `size`, and `variant`.
 
@@ -152,6 +158,8 @@ The workspace screen (`packages/app/src/screens/workspace/workspace-screen.tsx`)
 On a narrow desktop route, app navigation yields to the rendered content topology when the remaining width cannot preserve its center target: Settings keeps its 320px list + 400px detail split, and a workspace Explorer keeps its current visible width plus a 400px center pane. That is a topology decision at the app container, not a second compact breakpoint. Temporary width clamps are render-only; widening restores the user's saved sidebar widths.
 
 Electron window controls are top-corner obstructions, not a compact-layout condition. Rendered surfaces declare which top corners they physically occupy; only those corners receive clearance. Full-window overlays redeclare both corners. A focused split pane owns both corners; if focus restoration temporarily exposes the full split tree, the split boundary reserves one top strip instead of assigning a control rectangle to an arbitrarily narrow leaf. The 720px desktop breakpoint preserves the default 320px sidebar and target 400px center width when the Explorer is closed; it is product policy, not an obstruction gate.
+
+Windows and Linux controls are fixed window chrome, outside scrolling header content. A tab rail that reaches them ends at their obstruction and shows the shared overflow fade. On macOS, the Explorer toggle occupies a fixed top-right window slot so opening and closing Explorer does not move the pointer target.
 
 A new list+detail feature copies the settings shell. A new workspace-shaped feature copies the workspace shell. Inventing a third shape happens in design review, not in a PR.
 

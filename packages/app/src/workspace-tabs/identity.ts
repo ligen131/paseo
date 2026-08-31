@@ -15,6 +15,9 @@ export function normalizeWorkspaceTabTarget(
     const setup = normalizeWorkspaceDraftTabSetup(value.setup);
     return setup ? { kind: "draft", draftId, setup } : { kind: "draft", draftId };
   }
+  if (value.kind === "new_tab") {
+    return { kind: "new_tab" };
+  }
   if (value.kind === "agent") {
     const agentId = trimNonEmpty(value.agentId);
     return agentId ? { kind: "agent", agentId } : null;
@@ -31,6 +34,9 @@ export function normalizeWorkspaceTabTarget(
   }
   if (value.kind === "working_diff") {
     return normalizeWorkingDiffTabTarget(value);
+  }
+  if (value.kind === "plugin") {
+    return normalizePluginTabTarget(value);
   }
   return normalizeSimpleWorkspaceTabTarget(value);
 }
@@ -49,6 +55,7 @@ function normalizeSimpleWorkspaceTabTarget(value: WorkspaceTabTarget): Workspace
       const browserId = trimNonEmpty(value.browserId);
       return browserId ? { kind: "browser", browserId } : null;
     }
+    case "changes_tree":
     case "files":
     case "pull_request":
       return { kind: value.kind };
@@ -108,6 +115,15 @@ export function workspaceTabTargetsEqual(
   if (left.kind === "terminal" && right.kind === "terminal") {
     return left.terminalId === right.terminalId;
   }
+  if (left.kind === "plugin" && right.kind === "plugin") {
+    return (
+      left.pluginId === right.pluginId &&
+      left.panelId === right.panelId &&
+      left.context === right.context &&
+      (left.context === "workspace" ||
+        (right.context === "agent" && left.agentId === right.agentId))
+    );
+  }
   return secondaryWorkspaceTabTargetsEqual(left, right);
 }
 
@@ -125,6 +141,9 @@ function secondaryWorkspaceTabTargetsEqual(
     return left.focusPath === right.focusPath && left.focusRequestId === right.focusRequestId;
   }
   if (left.kind === "files" && right.kind === "files") {
+    return true;
+  }
+  if (left.kind === "changes_tree" && right.kind === "changes_tree") {
     return true;
   }
   if (left.kind === "pull_request" && right.kind === "pull_request") {
@@ -173,6 +192,9 @@ function recordsShallowEqual(
 }
 
 export function buildDeterministicWorkspaceTabId(target: WorkspaceTabTarget): string {
+  if (target.kind === "new_tab") {
+    throw new Error("New tabs do not have deterministic target identities");
+  }
   if (target.kind === "draft") {
     return target.draftId;
   }
@@ -197,10 +219,29 @@ export function buildDeterministicWorkspaceTabId(target: WorkspaceTabTarget): st
   if (target.kind === "working_diff") {
     return "working_diff";
   }
-  if (target.kind === "files" || target.kind === "pull_request") {
+  if (target.kind === "changes_tree" || target.kind === "files" || target.kind === "pull_request") {
     return target.kind;
   }
+  if (target.kind === "plugin") {
+    const identity = `${target.pluginId.length}_${target.pluginId}_${target.panelId.length}_${target.panelId}`;
+    return target.context === "workspace"
+      ? `plugin_workspace_${identity}`
+      : `plugin_agent_${identity}_${target.agentId.length}_${target.agentId}`;
+  }
   return `file_${target.path}`;
+}
+
+function normalizePluginTabTarget(
+  value: Extract<WorkspaceTabTarget, { kind: "plugin" }>,
+): WorkspaceTabTarget | null {
+  const pluginId = trimNonEmpty(value.pluginId);
+  const panelId = trimNonEmpty(value.panelId);
+  if (!pluginId || !panelId) return null;
+  if (value.context === "workspace") {
+    return { kind: "plugin", pluginId, panelId, context: "workspace" };
+  }
+  const agentId = trimNonEmpty(value.agentId);
+  return agentId ? { kind: "plugin", pluginId, panelId, context: "agent", agentId } : null;
 }
 
 function trimNonEmpty(value: string | null | undefined): string | null {
