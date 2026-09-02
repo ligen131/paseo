@@ -317,13 +317,11 @@ function WebStreamViewport(props: StreamRenderInput & { isMobileBreakpoint: bool
   const handleContentRef = useCallback((node: HTMLElement | null) => {
     contentRef.current = node;
   }, []);
-  const [followOutput, setFollowOutputr] = useState(true);
-  const followOutputRef = useRef(followOutput);
-  const setFollowOutput = (value: boolean) => {
+  const followOutputRef = useRef(true);
+  const setFollowOutput = useCallback((value: boolean) => {
     followOutputRef.current = value;
-    setFollowOutputr(value);
     return value;
-  };
+  }, []);
   const lastKnownScrollTopRef = useRef(0);
   const mouseScrollGestureRef = useRef<
     | { kind: "scrollbar"; pointerId: number }
@@ -363,7 +361,6 @@ function WebStreamViewport(props: StreamRenderInput & { isMobileBreakpoint: bool
   } = renderers;
 
   isActiveRef.current = isActive;
-  followOutputRef.current = followOutput;
 
   const hasRouteBottomAnchorRequest = routeBottomAnchorRequest !== null;
   const activationKey = routeBottomAnchorRequest?.requestKey ?? props.agentId;
@@ -777,6 +774,7 @@ function WebStreamViewport(props: StreamRenderInput & { isMobileBreakpoint: bool
   }, [
     evaluateHistoryStart,
     isJumpSettling,
+    setFollowOutput,
     stopFollowingOutputFromUserIntent,
     updateScrollMetrics,
   ]);
@@ -830,6 +828,7 @@ function WebStreamViewport(props: StreamRenderInput & { isMobileBreakpoint: bool
     hasRouteBottomAnchorRequest,
     isActivationReady,
     scheduleStickToBottom,
+    setFollowOutput,
   ]);
 
   // Following output is a layout invariant: rows, footer, and bottom offset must
@@ -971,7 +970,9 @@ function WebStreamViewport(props: StreamRenderInput & { isMobileBreakpoint: bool
 
     const markUpwardViewportInput = () => {
       markUpwardInputEvidence();
-      if (scrollContainer.scrollTop <= USER_SCROLL_DELTA_EPSILON) {
+      if (followOutputRef.current) {
+        stopFollowingOutputFromUserIntent();
+      } else if (scrollContainer.scrollTop <= USER_SCROLL_DELTA_EPSILON) {
         rearmHistoryStartFromUserIntent();
       }
     };
@@ -1019,11 +1020,20 @@ function WebStreamViewport(props: StreamRenderInput & { isMobileBreakpoint: bool
     };
     const handlePointerMove = (event: PointerEvent) => {
       const gesture = mouseScrollGestureRef.current;
-      if (!gesture || gesture.kind !== "autoscroll" || gesture.pointerId !== event.pointerId) {
+      if (!gesture || gesture.pointerId !== event.pointerId) {
+        return;
+      }
+      if (gesture.kind === "scrollbar") {
+        if (followOutputRef.current) {
+          stopFollowingOutputFromUserIntent();
+        }
         return;
       }
       if (event.clientY < gesture.lastClientY - USER_SCROLL_DELTA_EPSILON) {
         gesture.hasUpwardEvidence = true;
+        if (followOutputRef.current) {
+          stopFollowingOutputFromUserIntent();
+        }
         if (gesture.evidenceExpiryFrame !== null) {
           window.cancelAnimationFrame(gesture.evidenceExpiryFrame);
         }
@@ -1107,6 +1117,7 @@ function WebStreamViewport(props: StreamRenderInput & { isMobileBreakpoint: bool
     isActive,
     markUpwardInputEvidence,
     rearmHistoryStartFromUserIntent,
+    stopFollowingOutputFromUserIntent,
   ]);
 
   useEffect(() => {
@@ -1136,6 +1147,7 @@ function WebStreamViewport(props: StreamRenderInput & { isMobileBreakpoint: bool
     forceStickToBottom,
     scheduleStickToBottom,
     scrollToMessage,
+    setFollowOutput,
     viewportRef,
   ]);
 

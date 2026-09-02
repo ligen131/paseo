@@ -1216,10 +1216,21 @@ describe("createWebStreamStrategy", () => {
       pointerId: { value: 1 },
       pointerType: { value: "mouse" },
     });
-    act(() => scrollContainer.dispatchEvent(scrollbarPointerDown));
-    Object.defineProperty(scrollContainer, "scrollTop", { configurable: true, value: 700 });
-    act(() => scrollContainer.dispatchEvent(new Event("scroll")));
-    scrollTo.mockClear();
+    const scrollbarPointerMove = new MouseEvent("pointermove", {
+      bubbles: true,
+      buttons: 1,
+      clientX: 515,
+      clientY: 350,
+    });
+    Object.defineProperties(scrollbarPointerMove, {
+      isPrimary: { value: true },
+      pointerId: { value: 1 },
+      pointerType: { value: "mouse" },
+    });
+    act(() => {
+      scrollContainer.dispatchEvent(scrollbarPointerDown);
+      window.dispatchEvent(scrollbarPointerMove);
+    });
 
     Object.defineProperty(scrollContainer, "scrollHeight", { configurable: true, value: 1800 });
     act(() => {
@@ -1232,6 +1243,10 @@ describe("createWebStreamStrategy", () => {
       );
     });
     expect(scrollTo).not.toHaveBeenCalled();
+
+    Object.defineProperty(scrollContainer, "scrollTop", { configurable: true, value: 700 });
+    act(() => scrollContainer.dispatchEvent(new Event("scroll")));
+    scrollTo.mockClear();
 
     Object.defineProperty(scrollContainer, "scrollTop", { configurable: true, value: 1300 });
     act(() => scrollContainer.dispatchEvent(new Event("scroll")));
@@ -1331,6 +1346,76 @@ describe("createWebStreamStrategy", () => {
         }),
       );
     });
+    expect(scrollTo).not.toHaveBeenCalled();
+  });
+
+  it("stops bottom following as soon as an upward wheel intent arrives", () => {
+    const scrollTo = vi.fn(function (this: HTMLElement, options?: ScrollToOptions | number) {
+      const top = typeof options === "object" ? (options.top ?? 0) : 0;
+      Object.defineProperty(this, "scrollTop", { configurable: true, value: top });
+    });
+    HTMLElement.prototype.scrollTo = scrollTo;
+    const strategy = createWebStreamStrategy({ isMobileBreakpoint: true });
+    const viewportRef = React.createRef<StreamViewportHandle>();
+    const renderInput: StreamRenderInput = {
+      agentId: "agent",
+      segments: {
+        historyVirtualized: [],
+        historyMounted: [userMessage(1)],
+        liveHead: [],
+      },
+      boundary: {
+        hasVirtualizedHistory: false,
+        hasMountedHistory: true,
+        hasLiveHead: false,
+      },
+      renderers: createRenderers(vi.fn()),
+      listEmptyComponent: null,
+      viewportRef,
+      routeBottomAnchorRequest: null,
+      isAuthoritativeHistoryReady: true,
+      onNearBottomChange: vi.fn(),
+      onNearHistoryStart: vi.fn().mockReturnValue(true),
+      isLoadingOlderHistory: false,
+      hasOlderHistory: false,
+      olderHistoryProgressKey: null,
+      scrollEnabled: true,
+      listStyle: null,
+      baseListContentContainerStyle: null,
+      forwardListContentContainerStyle: null,
+    };
+    container = document.createElement("div");
+    document.body.appendChild(container);
+    root = createRoot(container);
+
+    act(() => root?.render(strategy.render(renderInput)));
+    const scrollContainer = container.querySelector('[data-testid="agent-chat-scroll"]');
+    if (!(scrollContainer instanceof HTMLElement)) {
+      throw new Error("Expected agent chat scroll container");
+    }
+    Object.defineProperty(scrollContainer, "clientHeight", { configurable: true, value: 500 });
+    Object.defineProperty(scrollContainer, "scrollHeight", { configurable: true, value: 1500 });
+    Object.defineProperty(scrollContainer, "scrollTop", { configurable: true, value: 1000 });
+    act(() => scrollContainer.dispatchEvent(new Event("scroll")));
+    scrollTo.mockClear();
+
+    // The wheel event arrives before the browser emits the corresponding scroll event. A stream
+    // update in that gap must not use the still-pending scroll event to pull the reader to bottom.
+    act(() => scrollContainer.dispatchEvent(new WheelEvent("wheel", { deltaY: -240 })));
+    Object.defineProperty(scrollContainer, "scrollHeight", { configurable: true, value: 1600 });
+    act(() =>
+      root?.render(
+        strategy.render({
+          ...renderInput,
+          segments: {
+            ...renderInput.segments,
+            liveHead: [userMessage(2)],
+          },
+          boundary: { ...renderInput.boundary, hasLiveHead: true },
+        }),
+      ),
+    );
+
     expect(scrollTo).not.toHaveBeenCalled();
   });
 
